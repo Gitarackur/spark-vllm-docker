@@ -1,0 +1,44 @@
+# Recipe: Nemotron-3-Super-NVFP4
+# Optimized for Marlin backend throughput
+recipe_version: "2"
+name: Nemotron-3-Super-NVFP4-Marlin-Optimized
+description: vLLM serving Nemotron-3-Super-120B using Marlin kernels
+
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+container: vllm-node
+solo_only: true
+
+mods: 
+  - mods/nemotron-super
+
+defaults:
+  port: 8888
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+  max_num_seqs: 8
+
+env:
+  # Marlin performance overrides
+  VLLM_NVFP4_GEMM_BACKEND: "marlin"
+  VLLM_TEST_FORCE_FP8_MARLIN: "1"
+  VLLM_MARLIN_USE_ATOMIC_ADD: "1"
+  # Disable conflicting backends
+  VLLM_FP8_BACKEND: "marlin"
+  VLLM_SCALED_MM_BACKEND: "marlin"
+
+command: |
+  vllm serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4  \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --port {port} --host {host} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8  \
+      --load-format fastsafetensors  \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-auto-tool-choice \
+      --tool-call-parser qwen3_coder \
+      --reasoning-parser-plugin super_v3_reasoning_parser.py \
+      --reasoning-parser super_v3
