@@ -157,6 +157,7 @@ Significantly refactored the internal cluster startup logic in `launch-cluster.s
 - Removed the standalone `run-cluster-node.sh` script; its logic is now fully integrated into `launch-cluster.sh`.
 - Ray head/worker startup, environment variable injection, and launch script distribution are now handled by `launch-cluster.sh` directly.
 - Worker containers are started with proper per-node environment variables (`VLLM_HOST_IP`, `NCCL_SOCKET_IFNAME`, etc.) injected via `docker run`/`docker exec` instead of relying on `.bashrc`.
+- You will now be able to run other vLLM containers without applying `use-ngc-vllm` mod (current version is just an empty stub).
 
 #### No-Ray Multi-Node Mode
 
