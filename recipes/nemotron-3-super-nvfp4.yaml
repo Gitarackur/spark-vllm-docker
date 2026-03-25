@@ -9,8 +9,12 @@ container: vllm-node
 cluster_only: false
 solo_only: false
 
-mods: 
-  - mods/nemotron-super
+# mods: 
+#   - mods/nemotron-super
+
+env:
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
 
 container: vllm-node
 defaults:
@@ -35,7 +39,8 @@ command: |
   --enable-auto-tool-choice \
   --load-format fastsafetensors \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser-plugin super_v3_reasoning_parser.py \
-  --reasoning-parser super_v3 \
+  --reasoning-parser nemotron_v3 \
+  --mamba_ssm_cache_dtype float32 \
   --tensor-parallel-size {tensor_parallel} \
+  --attention-backend TRITON_ATTN \
   --distributed-executor-backend ray
