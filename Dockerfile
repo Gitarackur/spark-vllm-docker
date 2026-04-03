@@ -204,7 +204,7 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         done; \
     fi
 
-# TEMPORARY PATCH for broken FP8 kernels
+# TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
 RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
     && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
          echo "PR 35568 already applied, skipping."; \
@@ -213,6 +213,16 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
          git apply -v pr35568.diff; \
        fi \
     && rm pr35568.diff
+
+# TEMPORARY PATCH for broken compilation - https://github.com/vllm-project/vllm/pull/38919
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/38919.diff -o pr38919.diff \
+    && if git apply --reverse --check pr38919.diff 2>/dev/null; then \
+         echo "PR 38919 already applied, skipping."; \
+       else \
+         echo "Applying PR 38919..."; \
+         git apply -v pr38919.diff; \
+       fi \
+    && rm pr38919.diff
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
