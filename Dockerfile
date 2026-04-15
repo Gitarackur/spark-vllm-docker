@@ -231,6 +231,16 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
        fi \
     && rm pr38919.diff
 
+# TEMPORARY PATCH for broken MiniMax M2.5 parser - https://github.com/vllm-project/vllm/pull/39861
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/39861.diff -o pr39861.diff \
+    && if git apply --reverse --check pr39861.diff 2>/dev/null; then \
+         echo "PR 39861 already applied, skipping."; \
+       else \
+         echo "Applying PR 39861..."; \
+         git apply -v pr39861.diff; \
+       fi \
+    && rm pr39861.diff
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
