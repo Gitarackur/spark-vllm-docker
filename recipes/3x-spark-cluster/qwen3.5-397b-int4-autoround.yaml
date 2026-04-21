@@ -4,8 +4,8 @@
 # If you experience node shutdown, please limit GPU clocks on the affected node (or both): `sudo nvidia-smi -lgc 200,2150`
 
 recipe_version: "1"
-name: Qwen3.5-397B-INT4-Autoround
-description: EXPERIMENTAL recipe for Qwen3.5-397B-INT4-Autoround (please refer to README for details! Use with `--no-ray` parameter!)
+name: Qwen3.5-397B-INT4-Autoround (PP=3)
+description: Recipe for Qwen3.5-397B-INT4-Autoround to run on 3-node mesh in pipeline-parallel mode
 
 # HuggingFace model to download (optional, for --download-model)
 model: Intel/Qwen3.5-397B-A17B-int4-AutoRound
@@ -22,17 +22,15 @@ build_args:
 mods:
   - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
-  - mods/gpu-mem-util-gb
-  - mods/drop-caches
 
 # Default settings (can be overridden via CLI)
 defaults:
   port: 8000
   host: 0.0.0.0
-  tensor_parallel: 2
-  gpu_memory_utilization: 112
+  pipeline_parallel: 3
+  gpu_memory_utilization: 0.7
   max_model_len: 262144
-  max_num_batched_tokens: 4176
+  max_num_batched_tokens: 16384
 
 # Environment variables
 env: 
@@ -43,9 +41,9 @@ env:
 command: |
   vllm serve Intel/Qwen3.5-397B-A17B-int4-AutoRound \
     --max-model-len {max_model_len} \
-    --max-num-seqs 2 \
+    --max-num-seqs 10 \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
     --enable-prefix-caching \
@@ -55,8 +53,9 @@ command: |
     --max-num-batched-tokens {max_num_batched_tokens} \
     --trust-remote-code \
     --chat-template unsloth.jinja \
-    --load-format instanttensor \
-    -tp {tensor_parallel} \
+    -tp 1 \
+    -pp {pipeline_parallel} \
+    --load-format fastsafetensors \
     --distributed-executor-backend ray
 
   

@@ -14,6 +14,8 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
+ENV DG_JIT_USE_NVRTC=1
+ENV USE_CUDNN=1
 
 # Set non-interactive frontend to prevent apt prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -27,6 +29,9 @@ ENV UV_CACHE_DIR=/root/.cache/uv
 ENV UV_SYSTEM_PYTHON=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV UV_LINK_MODE=copy
+# Set timeouts
+ENV UV_HTTP_TIMEOUT=600
+ENV UV_HTTP_RETRIES=10
 
 # Set the base directory environment variable
 ENV VLLM_BASE_DIR=/workspace/vllm
@@ -38,14 +43,14 @@ RUN apt update && \
     curl vim cmake build-essential ninja-build \
     libcudnn9-cuda-13 libcudnn9-dev-cuda-13 \
     python3-dev python3-pip git wget \
-    libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
-    ccache \
+    libibverbs1 libibverbs-dev rdma-core \
+    ccache devscripts debhelper fakeroot \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2" filelock pynvml requests tqdm
 
 # Configure Ccache for CUDA/C++
@@ -59,13 +64,18 @@ ENV CCACHE_COMPRESS=1
 ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
 ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
 
-# Setup Workspace
-WORKDIR $VLLM_BASE_DIR
-
 # 2. Set Environment Variables
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+
+# Setup Workspace
+WORKDIR $VLLM_BASE_DIR
+
+# Build NCCL with mesh support (TODO: only do it if arch is 12.1) - artifacts will be in /workspace/nccl/build/pkg/deb
+RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
+    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+    make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
 # =========================================================
 # STAGE 2: FlashInfer Builder
@@ -80,6 +90,10 @@ ARG FLASHINFER_REF=main
 # --- CACHE BUSTER ---
 # Change this argument to force a re-download of FlashInfer
 ARG CACHEBUST_FLASHINFER=1
+
+# Additional deps
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+     uv pip install packaging
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
@@ -104,6 +118,26 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cp -a /repo-cache/flashinfer /workspace/flashinfer
 
 WORKDIR /workspace/flashinfer
+
+ARG FLASHINFER_PRS=""
+
+RUN if [ -n "$FLASHINFER_PRS" ]; then \
+        echo "Applying PRs: $FLASHINFER_PRS"; \
+        for pr in $FLASHINFER_PRS; do \
+            echo "Fetching and applying PR #$pr..."; \
+            curl -fL "https://github.com/flashinfer-ai/flashinfer/pull/${pr}.diff" | git apply -v; \
+        done; \
+    fi
+
+# TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
+# RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
+#     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
+#          echo "PR #2927 already applied, skipping."; \
+#        else \
+#          echo "Applying FI PR #2927..."; \
+#          git apply -v pr2927.diff; \
+#        fi \
+#     && rm pr2927.diff
 
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
@@ -177,13 +211,43 @@ RUN if [ -n "$VLLM_PRS" ]; then \
         done; \
     fi
 
+# TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
+    && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
+         echo "PR 35568 already applied, skipping."; \
+       else \
+         echo "Applying PR 35568..."; \
+         git apply -v --exclude="tests/*" pr35568.diff; \
+       fi \
+    && rm pr35568.diff
+
+# TEMPORARY PATCH to re-enable Flashinfer 0.6.8 - https://github.com/vllm-project/vllm/pull/39959
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/39959.diff -o pr39959.diff \
+    && if git apply --reverse --check pr39959.diff 2>/dev/null; then \
+         echo "PR 39959 already applied, skipping."; \
+       else \
+         echo "Applying PR 39959..."; \
+         git apply -v pr39959.diff; \
+       fi \
+    && rm pr39959.diff
+
+# TEMPORARY PATCH to fix torch bindings - https://github.com/vllm-project/vllm/pull/40191
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/40191.diff -o pr40191.diff \
+    && if git apply --reverse --check pr40191.diff 2>/dev/null; then \
+         echo "PR 40191 already applied, skipping."; \
+       else \
+         echo "Applying PR 40191..."; \
+         git apply -v pr40191.diff; \
+       fi \
+    && rm pr40191.diff
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
-    sed -i '/^triton\b/d' requirements/test.txt && \
-    sed -i '/^fastsafetensors\b/d' requirements/test.txt && \
-    uv pip install -r requirements/build.txt
+    sed -i '/^triton\b/d' requirements/test/cuda.txt && \
+    sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
+    uv pip install -r requirements/build/cuda.txt
 
 # Apply Patches
 # TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
@@ -194,8 +258,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 #         patch -p1 < fastsafetensors.patch; \
 #     fi
 # TEMPORARY PATCH for broken vLLM build (unguarded Hopper code) - reverting PR #34758 and #34302
-RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
-RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
+# RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
+# RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
 
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
@@ -222,6 +286,8 @@ ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
 ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
+ENV DG_JIT_USE_NVRTC=1
+ENV USE_CUDNN=1
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
@@ -234,13 +300,16 @@ ENV UV_SYSTEM_PYTHON=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 ENV UV_LINK_MODE=copy
 
+# Mount additional packages from base builder image
 # Install runtime dependencies
-RUN apt update && \
+RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target=/workspace/nccl-pkg \
+    apt update && \
     apt install -y --no-install-recommends \
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
-    libnccl-dev libnccl2 libibverbs1 libibverbs-dev rdma-core \
+    libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
+    && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
@@ -256,7 +325,7 @@ ARG PRE_TRANSFORMERS=0
 
 # Install deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-     uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130 && \
+     uv pip install torch==2.11.0 torchvision torchaudio triton --index-url https://download.pytorch.org/whl/cu130 && \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
 
 # Install wheels from host ./wheels/ (bind-mounted from build context — no layer bloat)
@@ -282,7 +351,11 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 
 # Final extra deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install ray[default] fastsafetensors
+    uv pip install ray[default] fastsafetensors instanttensor
 
+# Fix NCCL
+RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
+    ln -s /usr/lib/aarch64-linux-gnu/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
+    
 # Build metadata (generated by build-and-copy.sh)
 COPY build-metadata.yaml /workspace/build-metadata.yaml

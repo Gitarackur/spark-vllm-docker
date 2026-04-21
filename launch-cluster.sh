@@ -24,12 +24,13 @@ CONTAINER_NAME="$DEFAULT_CONTAINER_NAME"
 COMMAND_TO_RUN=""
 DAEMON_MODE="false"
 CHECK_CONFIG="false"
-ACTION="start"
+ACTION=""
 CLUSTER_WAS_RUNNING="false"
 MOD_PATHS=()
 MOD_TYPES=()
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+CONFIG_FILE=""  # Will be set to default after argument parsing
 
 ACTIONS_ARG=""
 SOLO_MODE="false"
@@ -67,8 +68,30 @@ usage() {
     echo "  --mem-swap-limit-gb Memory+swap limit in GB (default: mem-limit + 10, only with --non-privileged)"
     echo "  --pids-limit    Process limit (default: 4096, only with --non-privileged)"
     echo "  --shm-size-gb   Shared memory size in GB (default: 64, only with --non-privileged)"
+    echo "  --config        Path to .env configuration file (default: .env in script directory)
+  --setup/--discover  Force autodiscovery and save configuration (even if .env exists)"
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
+    echo ""
+    echo "Supported .env file variables:"
+    echo "  CLUSTER_NODES       Comma-separated list of node IPs"
+    echo "  ETH_IF              Ethernet interface name"
+    echo "  IB_IF               InfiniBand interface name"
+    echo "  MASTER_PORT         Port for cluster coordination (default: 29501)"
+    echo "  CONTAINER_NAME      Container name (default: vllm_node)"
+    echo "  LOCAL_IP            Local IP address (for solo mode or override auto-detection)"
+    echo "  CONTAINER_*         Any variable starting with CONTAINER_ (except CONTAINER_NAME)"
+    echo "                      becomes -e flag. Example: CONTAINER_NCCL_DEBUG=INFO -> -e NCCL_DEBUG=INFO"
+    echo ""
+    echo "Example .env file:"
+    echo "  CLUSTER_NODES=192.168.1.1,192.168.1.2"
+    echo "  ETH_IF=eth0"
+    echo "  IB_IF=ib0"
+    echo "  MASTER_PORT=29501"
+    echo "  CONTAINER_NAME=vllm_node"
+    echo "  LOCAL_IP=192.168.1.1"
+    echo "  CONTAINER_NCCL_DEBUG=INFO"
+    echo "  CONTAINER_HF_TOKEN=abc123"
     echo ""
     echo "Launch Script Usage:"
     echo "  $0 --launch-script examples/my-script.sh   # Script copied to container and executed"
@@ -108,6 +131,8 @@ while [[ "$#" -gt 0 ]]; do
         --shm-size-gb) SHM_SIZE_GB="$2"; shift ;;
         -d) DAEMON_MODE="true" ;;
         -h|--help) usage ;;
+        --config) CONFIG_FILE="$2"; shift ;;
+        --setup|--discover) FORCE_DISCOVER=true; export FORCE_DISCOVER ;;
         start|stop|status) 
             if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
                 echo "Error: Action '$1' is not compatible with --launch-script. Please omit the action or not use --launch-script."
@@ -132,6 +157,115 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# Set .env file path (use default if not specified)
+if [[ -z "$CONFIG_FILE" ]]; then
+    CONFIG_FILE="$SCRIPT_DIR/.env"
+    CONFIG_FILE_SET=false
+else
+    CONFIG_FILE_SET=true
+fi
+
+# Load .env file
+if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Loading configuration from .env file..."
+    
+    # Validate .env file syntax
+    if ! python3 -c "
+import sys
+import re
+
+env_file = '$CONFIG_FILE'
+seen_keys = set()
+
+with open(env_file, 'r') as f:
+    for line_num, line in enumerate(f, 1):
+        line = line.strip()
+        # Skip empty lines and comments
+        if not line or line.startswith('#'):
+            continue
+        
+        # Check for key=value format
+        if '=' not in line:
+            print(f'Error: Invalid syntax at line {line_num}: missing \"=\"')
+            sys.exit(1)
+        
+        key = line.split('=', 1)[0].strip()
+        
+        # Validate key format (alphanumeric + underscore)
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+            print(f'Error: Invalid key format at line {line_num}: {key}')
+            sys.exit(1)
+        
+        # Check for duplicates
+        if key in seen_keys:
+            print(f'Error: Duplicate key at line {line_num}: {key}')
+            sys.exit(1)
+        
+        seen_keys.add(key)
+
+sys.exit(0)
+" 2>/dev/null; then
+        echo "Error: Invalid .env file syntax. Aborting."
+        exit 1
+    fi
+    
+    # Load .env variables with DOTENV_ prefix
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        
+        # Remove leading/trailing whitespace from key
+        key=$(echo "$key" | xargs)
+        
+        # Skip if key is empty after trimming
+        [[ -z "$key" ]] && continue
+        
+        # Remove quotes and whitespace from value using Python for proper shlex handling
+        value=$(python3 -c "
+import shlex
+import sys
+value = '''$value'''
+# Strip whitespace
+value = value.strip()
+# Remove surrounding quotes if present
+if (value.startswith('\"') and value.endswith('\"')) or (value.startswith(\"'\" ) and value.endswith(\"'\")):
+    value = value[1:-1]
+print(value)
+")
+        
+        # Export with DOTENV_ prefix
+        export "DOTENV_$key=$value"
+    done < "$CONFIG_FILE"
+    
+    echo "Loaded .env variables: $(compgen -v DOTENV_ | tr '\n' ' ')"
+fi
+
+# Apply .env configuration (CLI args take precedence)
+if [[ -z "$NODES_ARG" && -n "$DOTENV_CLUSTER_NODES" ]]; then
+    NODES_ARG="$DOTENV_CLUSTER_NODES"
+fi
+
+if [[ -z "$ETH_IF" && -n "$DOTENV_ETH_IF" ]]; then
+    ETH_IF="$DOTENV_ETH_IF"
+fi
+
+if [[ -z "$IB_IF" && -n "$DOTENV_IB_IF" ]]; then
+    IB_IF="$DOTENV_IB_IF"
+fi
+
+if [[ -z "$MASTER_PORT" || "$MASTER_PORT" == "29501" ]] && [[ -n "$DOTENV_MASTER_PORT" ]]; then
+    MASTER_PORT="$DOTENV_MASTER_PORT"
+fi
+
+if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" ]] && [[ -n "$DOTENV_CONTAINER_NAME" ]]; then
+    CONTAINER_NAME="$DOTENV_CONTAINER_NAME"
+fi
+
+if [[ -n "$DOTENV_LOCAL_IP" ]]; then
+    export LOCAL_IP="$DOTENV_LOCAL_IP"
+fi
 
 # Validate non-privileged mode flags
 if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
@@ -162,6 +296,26 @@ if [[ -n "$NCCL_DEBUG_VAL" ]]; then
             ;;
     esac
 fi
+
+# Add container environment variables from .env (CONTAINER_* pattern)
+# Excludes CONTAINER_NAME which is a configuration variable, not an env var
+for env_var in $(compgen -v DOTENV_CONTAINER_); do
+    # Skip CONTAINER_NAME as it's a configuration variable
+    [[ "$env_var" == "DOTENV_CONTAINER_NAME" ]] && continue
+    
+    # Get the value
+    value="${!env_var}"
+    
+    # Extract the actual env var name (remove DOTENV_CONTAINER_ prefix)
+    actual_var="${env_var#DOTENV_CONTAINER_}"
+    
+    # Properly escape the value for shell using Python
+    escaped_value=$(python3 -c "import shlex; print(shlex.quote('$value'))")
+    
+    # Add to docker args
+    DOCKER_ARGS="$DOCKER_ARGS -e $actual_var=$escaped_value"
+    echo "Adding container env: $actual_var"
+done
 
 # Add build job parallelization environment variables if BUILD_JOBS is set
 if [[ -n "$BUILD_JOBS" ]]; then
@@ -214,7 +368,7 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     LAUNCH_SCRIPT_MODE="true"
 
     # If launch script is specified, default action to exec unless explicitly set to stop/status
-    if [[ "$ACTION" == "start" ]]; then
+    if [[ -z "$ACTION" || "$ACTION" == "start" ]]; then
         ACTION="exec"
     fi
 fi
@@ -259,13 +413,33 @@ done
 # Source autodiscover module
 source "$(dirname "$0")/autodiscover.sh"
 
-if [[ "$SOLO_MODE" == "true" ]]; then
-    if [[ -n "$NODES_ARG" ]]; then
-        echo "Error: --solo is incompatible with -n/--nodes."
-        exit 1
+if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
+    # --setup: force full autodiscovery and save configuration
+    echo "Running full autodiscovery (--setup)..."
+    # Clear pre-loaded values so detect functions run fresh instead of short-circuiting
+    ETH_IF="" IB_IF="" NODES_ARG="" LOCAL_IP=""
+    detect_interfaces || exit 1
+    detect_local_ip || exit 1
+    detect_nodes || exit 1
+    detect_copy_hosts || exit 1
+    save_config || exit 1
+    # Reload .env so DOTENV_* variables reflect saved config
+    load_env_if_exists
+    [[ -z "$NODES_ARG" && -n "$DOTENV_CLUSTER_NODES" ]] && NODES_ARG="$DOTENV_CLUSTER_NODES"
+    [[ -z "$ETH_IF" && -n "$DOTENV_ETH_IF" ]] && ETH_IF="$DOTENV_ETH_IF"
+    [[ -z "$IB_IF" && -n "$DOTENV_IB_IF" ]] && IB_IF="$DOTENV_IB_IF"
+    # If no action was specified, setup was the only intent — exit cleanly
+    if [[ -z "$ACTION" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then
+        exit 0
     fi
+fi
+
+if [[ "$SOLO_MODE" == "true" ]]; then
     # Solo mode: skip node detection, just get local IP
-    LOCAL_IP="127.0.0.1"
+    # Use LOCAL_IP from .env if set, otherwise default to 127.0.0.1
+    if [[ -z "$LOCAL_IP" ]]; then
+        LOCAL_IP="127.0.0.1"
+    fi
     NODES_ARG="$LOCAL_IP"
     PEER_NODES=()
     echo "Solo mode enabled. Skipping node detection."
@@ -335,6 +509,12 @@ if [[ "$ACTION" == "start" || "$ACTION" == "exec" || "$CHECK_CONFIG" == "true" ]
             echo "  SSH to $worker: OK"
         done
     fi
+fi
+
+if [[ -z "$ACTION" && "$LAUNCH_SCRIPT_MODE" != "true" && "$CHECK_CONFIG" != "true" ]]; then
+    echo "Error: No action specified. Use: start | stop | status | exec"
+    usage
+    exit 1
 fi
 
 if [[ "$CHECK_CONFIG" == "true" ]]; then
@@ -550,6 +730,32 @@ apply_mod_to_container() {
     if [[ "$is_local" == "false" ]]; then
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" "rm -rf $remote_cleanup_path"
     fi
+}
+
+# Parse -tp/-pp/-dp (and long forms) from a text string (command or script content).
+# Sets TP_SIZE, PP_SIZE, DP_SIZE, PARALLELISM_FOUND globals.
+# Only acts when at least one parallelism flag is present.
+parse_parallelism_from_text() {
+    local text="$1"
+    TP_SIZE=1; PP_SIZE=1; DP_SIZE=1
+    PARALLELISM_FOUND=false
+
+    # Normalize --flag=value to --flag value for uniform word-by-word parsing
+    local normalized
+    normalized=$(echo "$text" | sed 's/\(--[a-z-]*\)=/\1 /g')
+
+    local prev=""
+    for word in $normalized; do
+        case "$prev" in
+            -tp|--tensor-parallel-size)
+                [[ "$word" =~ ^[0-9]+$ ]] && TP_SIZE="$word" && PARALLELISM_FOUND=true ;;
+            -pp|--pipeline-parallel-size)
+                [[ "$word" =~ ^[0-9]+$ ]] && PP_SIZE="$word" && PARALLELISM_FOUND=true ;;
+            -dp|--data-parallel-size)
+                [[ "$word" =~ ^[0-9]+$ ]] && DP_SIZE="$word" && PARALLELISM_FOUND=true ;;
+        esac
+        prev="$word"
+    done
 }
 
 # Build a patched copy of the launch script on the host for a specific node.
@@ -771,8 +977,10 @@ exec_no_ray_cluster() {
             worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT --headless"
         fi
         echo "Launching worker (rank $rank) on $worker..."
-        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" \
-            "docker exec -d $CONTAINER_NAME bash -c \"$worker_cmd >> /proc/1/fd/1 2>&1\""
+        local remote_payload remote_cmd
+        remote_payload="$worker_cmd >> /proc/1/fd/1 2>&1"
+        printf -v remote_cmd 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$remote_payload"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$remote_cmd"
         (( rank++ ))
     done
 
@@ -797,6 +1005,29 @@ exec_no_ray_cluster() {
 }
 
 if [[ "$ACTION" == "exec" ]]; then
+    # Trim (or error on) PEER_NODES based on declared parallelism, for any multi-node exec
+    if [[ "$SOLO_MODE" != "true" && ${#PEER_NODES[@]} -gt 0 ]]; then
+        if [[ "$LAUNCH_SCRIPT_MODE" == "true" ]]; then
+            cmd_text=$(cat "$LAUNCH_SCRIPT_PATH" 2>/dev/null || true)
+        else
+            cmd_text="$COMMAND_TO_RUN"
+        fi
+        parse_parallelism_from_text "$cmd_text"
+
+        if [[ "$PARALLELISM_FOUND" == "true" ]]; then
+            required_nodes=$(( TP_SIZE * PP_SIZE * DP_SIZE ))
+            total_nodes=$(( 1 + ${#PEER_NODES[@]} ))
+
+            if [[ "$required_nodes" -gt "$total_nodes" ]]; then
+                echo "Error: Command requires $required_nodes nodes (tp=$TP_SIZE * pp=$PP_SIZE * dp=$DP_SIZE) but only $total_nodes node(s) are configured."
+                exit 1
+            elif [[ "$required_nodes" -lt "$total_nodes" ]]; then
+                echo "Note: Command requires $required_nodes node(s) (tp=$TP_SIZE * pp=$PP_SIZE * dp=$DP_SIZE); using $required_nodes of $total_nodes configured node(s)."
+                PEER_NODES=("${PEER_NODES[@]:0:$(( required_nodes - 1 ))}")
+            fi
+        fi
+    fi
+
     start_cluster
     echo "Executing command: $COMMAND_TO_RUN"
 

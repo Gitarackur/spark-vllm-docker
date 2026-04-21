@@ -16,8 +16,6 @@ container: vllm-node-tf5
 
 build_args:
   - --tf5
-  - --rebuild-flashinfer
-  - --rebuild-vllm
 
 # Mod required to fix ROPE syntax error
 mods:

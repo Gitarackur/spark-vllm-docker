@@ -6,17 +6,22 @@ START_TIME=$(date +%s)
 
 # Default values
 IMAGE_TAG="vllm-node"
+IMAGE_TAG_SET=false
 REBUILD_FLASHINFER=false
 REBUILD_VLLM=false
 COPY_HOSTS=()
+COPY_TO_FLAG=false
 SSH_USER="$USER"
 NO_BUILD=false
 VLLM_REF="main"
+VLLM_REF_SET=false
+FLASHINFER_REF="main"
+FLASHINFER_REF_SET=false
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
-VLLM_REF_SET=false
 VLLM_PRS=""
+FLASHINFER_PRS=""
 PRE_TRANSFORMERS=false
 FULL_LOG=false
 BUILD_JOBS="16"
@@ -27,6 +32,8 @@ FLASHINFER_RELEASE_TAG="prebuilt-flashinfer-current"
 VLLM_RELEASE_TAG="prebuilt-vllm-current"
 # Space-separated list of GPU architectures for which prebuilt wheels are available
 PREBUILT_WHEELS_SUPPORTED_ARCHS="12.1a"
+CLEANUP_MODE="false"
+CONFIG_FILE=""
 
 cleanup() {
     if [ -n "$TMP_IMAGE" ] && [ -f "$TMP_IMAGE" ]; then
@@ -262,11 +269,12 @@ if downloads:
 # Help function
 usage() {
     echo "Usage: $0 [OPTIONS]"
-    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-node')"
+    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
     echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
+    echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
     echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
@@ -275,48 +283,34 @@ usage() {
     echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
     echo "  --network <network>           : Docker network to use during build"
+    echo "  --cleanup                     : Remove all *.whl and *.-commit files in wheels directory"
+    echo "  --config                      : Path to .env configuration file (default: .env in script directory)"
+    echo "  --setup                       : Force autodiscovery and save configuration (even if .env exists)"
     echo "  -h, --help                    : Show this help message"
     exit 1
 }
 
-# Argument parsing
+# Parse all arguments
+CONFIG_FILE_SET=false
 while [[ "$#" -gt 0 ]]; do
     case $1 in
-        -t|--tag) IMAGE_TAG="$2"; shift ;;
+        -t|--tag) IMAGE_TAG="$2"; IMAGE_TAG_SET=true; shift ;;
         --gpu-arch) GPU_ARCH_LIST="$2"; shift ;;
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
+        --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
+            COPY_TO_FLAG=true
             shift
             while [[ "$#" -gt 0 && "$1" != -* ]]; do
                 add_copy_hosts "$1"
                 shift
             done
-
-            if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
-                echo "No hosts specified. Using autodiscovery..."
-                source "$(dirname "$0")/autodiscover.sh"
-
-                detect_nodes
-                if [ $? -ne 0 ]; then
-                    echo "Error: Autodiscovery failed."
-                    exit 1
-                fi
-
-                if [ ${#PEER_NODES[@]} -gt 0 ]; then
-                    COPY_HOSTS=("${PEER_NODES[@]}")
-                fi
-
-                if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
-                     echo "Error: Autodiscovery found no other nodes."
-                     exit 1
-                fi
-                echo "Autodiscovered hosts: ${COPY_HOSTS[*]}"
-            fi
             continue
             ;;
         -j|--build-jobs) BUILD_JOBS="$2"; shift ;;
@@ -337,8 +331,22 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-flashinfer-pr)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+               if [ -n "$FLASHINFER_PRS" ]; then
+                   FLASHINFER_PRS="$FLASHINFER_PRS $2"
+               else
+                   FLASHINFER_PRS="$2"
+               fi
+               shift
+            else
+               echo "Error: --apply-flashinfer-pr requires a PR number."
+               exit 1
+            fi
+            ;;
         --full-log) FULL_LOG=true ;;
         --no-build) NO_BUILD=true ;;
+        --cleanup) CLEANUP_MODE=true ;;
         --network)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                 NETWORK_ARG="$2"
@@ -348,19 +356,75 @@ while [[ "$#" -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --config) CONFIG_FILE="$2"; CONFIG_FILE_SET=true; shift ;;
+        --setup) FORCE_DISCOVER=true; export FORCE_DISCOVER ;;
         -h|--help) usage ;;
         *) echo "Unknown parameter passed: $1"; usage ;;
     esac
     shift
 done
 
+# Apply default IMAGE_TAG based on flags if -t was not specified
+if [ "$IMAGE_TAG_SET" = false ]; then
+    if [ "$PRE_TRANSFORMERS" = true ]; then
+        IMAGE_TAG="vllm-node-tf5"
+    elif [ "$EXP_MXFP4" = true ]; then
+        IMAGE_TAG="vllm-node-mxfp4"
+    fi
+fi
+
+# Source autodiscover.sh to load .env file
+source "$(dirname "$0")/autodiscover.sh"
+
+# If --setup: force full autodiscovery and save configuration
+if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
+    echo "Running full autodiscovery (--setup)..."
+    detect_interfaces || exit 1
+    detect_local_ip || exit 1
+    detect_nodes || exit 1
+    detect_copy_hosts || exit 1
+    save_config || exit 1
+    # Reload .env so DOTENV_* variables reflect saved config
+    load_env_if_exists
+fi
+
+# Handle COPY_HOSTS from .env or autodiscovery only if -c was explicitly specified
+if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
+    if [[ -n "$DOTENV_COPY_HOSTS" ]]; then
+        echo "Using COPY_HOSTS from .env: $DOTENV_COPY_HOSTS"
+        IFS=',' read -ra HOSTS_FROM_ENV <<< "$DOTENV_COPY_HOSTS"
+        COPY_HOSTS=("${HOSTS_FROM_ENV[@]}")
+    else
+        echo "No hosts specified. Using autodiscovery..."
+        detect_interfaces || { echo "Error: Interface detection failed."; exit 1; }
+        detect_local_ip || { echo "Error: Local IP detection failed."; exit 1; }
+        detect_nodes || { echo "Error: Node detection failed."; exit 1; }
+        detect_copy_hosts || { echo "Error: Copy host detection failed."; exit 1; }
+
+        if [ "${#COPY_PEER_NODES[@]}" -gt 0 ]; then
+            COPY_HOSTS=("${COPY_PEER_NODES[@]}")
+        fi
+
+        if [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
+            echo "Error: Autodiscovery found no other nodes."
+            exit 1
+        fi
+        echo "Autodiscovered hosts: ${COPY_HOSTS[*]}"
+    fi
+fi
+
 # Validate flag combinations
 if [ -n "$VLLM_PRS" ]; then
     if [ "$EXP_MXFP4" = true ]; then echo "Error: --apply-vllm-pr is incompatible with --exp-mxfp4"; exit 1; fi
 fi
 
+if [ -n "$FLASHINFER_PRS" ]; then
+    if [ "$EXP_MXFP4" = true ]; then echo "Error: --apply-flashinfer-pr is incompatible with --exp-mxfp4"; exit 1; fi
+fi
+
 if [ "$EXP_MXFP4" = true ]; then
     if [ "$VLLM_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --vllm-ref"; exit 1; fi
+    if [ "$FLASHINFER_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --flashinfer-ref"; exit 1; fi
     if [ "$PRE_TRANSFORMERS" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --tf5"; exit 1; fi
     if [ "$REBUILD_FLASHINFER" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-flashinfer"; exit 1; fi
     if [ "$REBUILD_VLLM" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-vllm"; exit 1; fi
@@ -370,6 +434,30 @@ fi
 if [ "$NO_BUILD" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
     echo "Error: --no-build requires --copy-to to be specified"
     exit 1
+fi
+
+# Handle cleanup mode
+if [[ "$CLEANUP_MODE" == "true" ]]; then
+    WHEELS_DIR="./wheels"
+    echo "Cleaning up wheels directory..."
+    
+    # Remove all .whl files
+    if compgen -G "$WHEELS_DIR/*.whl" > /dev/null 2>&1; then
+        rm -f "$WHEELS_DIR"/*.whl
+        echo "Removed *.whl files from $WHEELS_DIR"
+    else
+        echo "No *.whl files found in $WHEELS_DIR"
+    fi
+    
+    # Remove all .-commit files
+    if compgen -G "$WHEELS_DIR/.*-commit" > /dev/null 2>&1; then
+        rm -f "$WHEELS_DIR"/.*-commit
+        echo "Removed .*-commit files from $WHEELS_DIR"
+    else
+        echo "No .*-commit files found in $WHEELS_DIR"
+    fi
+    
+    echo "Cleanup complete."
 fi
 
 # Ensure wheels directory exists
@@ -414,9 +502,21 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 1: FlashInfer wheels
         # ----------------------------------------------------------
+        if [ "$FLASHINFER_REF_SET" = true ] || [ -n "$FLASHINFER_PRS" ]; then
+            REBUILD_FLASHINFER=true
+        fi
+
         BUILD_FLASHINFER=false
         if [ "$REBUILD_FLASHINFER" = true ]; then
-            echo "Rebuilding FlashInfer wheels (--rebuild-flashinfer specified)..."
+            if [ "$FLASHINFER_REF_SET" = true ] && [ -n "$FLASHINFER_PRS" ]; then
+                echo "Rebuilding FlashInfer wheels (--flashinfer-ref and --apply-flashinfer-pr specified)..."
+            elif [ "$FLASHINFER_REF_SET" = true ]; then
+                echo "Rebuilding FlashInfer wheels (--flashinfer-ref specified)..."
+            elif [ -n "$FLASHINFER_PRS" ]; then
+                echo "Rebuilding FlashInfer wheels (--apply-flashinfer-pr specified)..."
+            else
+                echo "Rebuilding FlashInfer wheels (--rebuild-flashinfer specified)..."
+            fi
             BUILD_FLASHINFER=true
         elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer"; then
             echo "FlashInfer wheels ready."
@@ -438,10 +538,16 @@ if [ "$NO_BUILD" = false ]; then
             FI_CMD=("docker" "build"
                 "--target" "flashinfer-export"
                 "--output" "type=local,dest=./wheels"
-                "${COMMON_BUILD_FLAGS[@]}")
+                "${COMMON_BUILD_FLAGS[@]}"
+                "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF")
 
             if [ "$REBUILD_FLASHINFER" = true ]; then
                 FI_CMD+=("--build-arg" "CACHEBUST_FLASHINFER=$(date +%s)")
+            fi
+
+            if [ -n "$FLASHINFER_PRS" ]; then
+                echo "Applying FlashInfer PRs: $FLASHINFER_PRS"
+                FI_CMD+=("--build-arg" "FLASHINFER_PRS=$FLASHINFER_PRS")
             fi
 
             FI_CMD+=(".")
