@@ -82,7 +82,7 @@ index 5909b3043..c2607df6a 100644
 @@ -234,6 +239,7 @@ class LLM:
          chat_template: Path | str | None = None,
          seed: int = 0,
-         gpu_memory_utilization: float = 0.9,
+         gpu_memory_utilization: float = 0.92,
 +        gpu_memory_utilization_gb: float | None = None,
          cpu_offload_gb: float = 0,
          offload_group_size: int = 0,

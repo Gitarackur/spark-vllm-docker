@@ -19,8 +19,8 @@ build_args:
   - --tf5
 
 # Mods
-mods:
-  - mods/fix-gemma4-tool-parser
+# mods:
+  # - mods/fix-gemma4-tool-parser
 
 # Default settings (can be overridden via CLI)
 defaults:
@@ -41,7 +41,7 @@ command: |
     --gpu-memory-utilization {gpu_memory_utilization} \
     --port {port} \
     --host {host} \
-    --load-format fastsafetensors \
+    --load-format safetensors \
     --enable-prefix-caching \
     --enable-auto-tool-choice \
     --tool-call-parser gemma4 \

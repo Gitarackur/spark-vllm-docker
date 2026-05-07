@@ -122,10 +122,15 @@ WORKDIR /workspace/flashinfer
 ARG FLASHINFER_PRS=""
 
 RUN if [ -n "$FLASHINFER_PRS" ]; then \
+        # Git requires a user identity to create merge commits
+        git config --global user.email "builder@example.com"; \
+        git config --global user.name "Docker Builder"; \
+        \
         echo "Applying PRs: $FLASHINFER_PRS"; \
         for pr in $FLASHINFER_PRS; do \
-            echo "Fetching and applying PR #$pr..."; \
-            curl -fL "https://github.com/flashinfer-ai/flashinfer/pull/${pr}.diff" | git apply -v; \
+            echo "Fetching and merging PR #$pr..."; \
+            git fetch origin pull/${pr}/head:pr-${pr}; \
+            git merge pr-${pr} --no-edit; \
         done; \
     fi
 
@@ -204,10 +209,15 @@ WORKDIR $VLLM_BASE_DIR/vllm
 ARG VLLM_PRS=""
 
 RUN if [ -n "$VLLM_PRS" ]; then \
+        # Git requires a user identity to create merge commits
+        git config --global user.email "builder@example.com"; \
+        git config --global user.name "Docker Builder"; \
+        \
         echo "Applying PRs: $VLLM_PRS"; \
         for pr in $VLLM_PRS; do \
-            echo "Fetching and applying PR #$pr..."; \
-            curl -fL "https://github.com/vllm-project/vllm/pull/${pr}.diff" | git apply -v; \
+            echo "Fetching and merging PR #$pr..."; \
+            git fetch origin pull/${pr}/head:pr-${pr}; \
+            git merge pr-${pr} --no-edit; \
         done; \
     fi
 
@@ -220,26 +230,6 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
          git apply -v --exclude="tests/*" pr35568.diff; \
        fi \
     && rm pr35568.diff
-
-# TEMPORARY PATCH to re-enable Flashinfer 0.6.8 - https://github.com/vllm-project/vllm/pull/39959
-RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/39959.diff -o pr39959.diff \
-    && if git apply --reverse --check pr39959.diff 2>/dev/null; then \
-         echo "PR 39959 already applied, skipping."; \
-       else \
-         echo "Applying PR 39959..."; \
-         git apply -v pr39959.diff; \
-       fi \
-    && rm pr39959.diff
-
-# TEMPORARY PATCH to fix torch bindings - https://github.com/vllm-project/vllm/pull/40191
-RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/40191.diff -o pr40191.diff \
-    && if git apply --reverse --check pr40191.diff 2>/dev/null; then \
-         echo "PR 40191 already applied, skipping."; \
-       else \
-         echo "Applying PR 40191..."; \
-         git apply -v pr40191.diff; \
-       fi \
-    && rm pr40191.diff
 
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
