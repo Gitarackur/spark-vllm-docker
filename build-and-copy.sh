@@ -98,6 +98,15 @@ add_copy_hosts() {
     done
 }
 
+# Convert --gpu-arch value (e.g. 12.0, 12.0f, 12.1a) to NCCL NVCC_GENCODE format.
+gpu_arch_to_nccl_gencode() {
+    local arch="$1"
+    # Strip optional feature suffix (12.1a -> 12.1, 12.0f -> 12.0).
+    arch="${arch%[a-z]}"
+    local sm="${arch//./}"
+    echo "-gencode=arch=compute_${sm},code=sm_${sm}"
+}
+
 get_remote_image_id() {
     local host="$1"
     local image="$2"
@@ -383,7 +392,7 @@ usage() {
     echo "Usage: $0 [OPTIONS]"
     echo "  -t, --tag <tag>               : Local image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
     echo "  --use-wheels                  : Build runner image from prebuilt or local wheels instead of pulling ${PREBUILT_RUNNER_IMAGE}"
-    echo "  --gpu-arch <arch>             : GPU architecture for wheel/source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
+    echo "  --gpu-arch <arch>             : GPU architecture for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
     echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
@@ -621,6 +630,8 @@ fi
 COMMON_BUILD_FLAGS+=("--build-arg" "BUILD_JOBS=$BUILD_JOBS")
 COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
+NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "$GPU_ARCH_LIST")"
+COMMON_BUILD_FLAGS+=("--build-arg" "NCCL_NVCC_GENCODE=$NCCL_NVCC_GENCODE")
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi

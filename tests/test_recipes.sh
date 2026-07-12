@@ -467,6 +467,13 @@ test_launch_cluster_help() {
         log_verbose "$output"
     fi
 
+    if echo "$output" | grep -q -- "--earlyoom"; then
+        log_pass "--help documents --earlyoom"
+    else
+        log_fail "--help does not document --earlyoom"
+        log_verbose "$output"
+    fi
+
     if echo "$output" | grep -q -- "--ray"; then
         log_pass "--help documents --ray"
     else
@@ -962,6 +969,50 @@ test_launch_cmd_keep_entrypoint_passthrough() {
     else
         log_fail "--keep-entrypoint not found in launch command"
         log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: --earlyoom passthrough to launch-cluster.sh
+test_launch_cmd_earlyoom_passthrough() {
+    log_test "Launch command includes --earlyoom"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120" 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+
+    if echo "$launch_cmd" | grep -q "\-\-earlyoom" && \
+       echo "$launch_cmd" | grep -q "\-\-earlyoom-args -M 786432,196608 -s 100 -r 120"; then
+        log_pass "Launch command includes --earlyoom and custom args"
+    else
+        log_fail "--earlyoom flags not found in launch command"
+        log_verbose "Launch cmd: $launch_cmd"
+    fi
+}
+
+# Test: --earlyoom rejects --keep-entrypoint
+test_launch_cmd_earlyoom_rejects_keep_entrypoint() {
+    log_test "--earlyoom rejects --keep-entrypoint"
+
+    recipe_name=$(find_solo_recipe)
+    if [[ -z "$recipe_name" ]]; then
+        log_skip "No solo-capable recipes found"
+        return
+    fi
+
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --earlyoom --keep-entrypoint 2>&1 || true)
+
+    if echo "$output" | grep -q "\-\-earlyoom requires launch-cluster.sh to clear the image entrypoint"; then
+        log_pass "--earlyoom rejects --keep-entrypoint"
+    else
+        log_fail "--earlyoom did not reject --keep-entrypoint"
+        log_verbose "$output"
     fi
 }
 
@@ -1468,6 +1519,8 @@ main() {
     test_launch_cmd_publish_passthrough
     test_launch_cmd_publish_rejects_cluster
     test_launch_cmd_keep_entrypoint_passthrough
+    test_launch_cmd_earlyoom_passthrough
+    test_launch_cmd_earlyoom_rejects_keep_entrypoint
     echo ""
     
     # README documentation verification tests

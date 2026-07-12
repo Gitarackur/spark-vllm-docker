@@ -880,6 +880,18 @@ Examples:
         help="Keep the Docker image entrypoint instead of clearing it before launch",
     )
     launch_group.add_argument(
+        "--earlyoom",
+        action="store_true",
+        dest="earlyoom",
+        help="Run earlyoom as the container foreground process instead of sleep infinity",
+    )
+    launch_group.add_argument(
+        "--earlyoom-args",
+        dest="earlyoom_args",
+        metavar="ARGS",
+        help="Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')",
+    )
+    launch_group.add_argument(
         "--non-privileged",
         action="store_true",
         dest="non_privileged",
@@ -1079,6 +1091,11 @@ Examples:
             "Error: -p/--publish port forwarding is only supported in solo mode."
         )
         print("Use --solo or remove port mappings for cluster mode.")
+        return 1
+
+    if (args.earlyoom or args.earlyoom_args) and args.keep_entrypoint:
+        print("Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint.")
+        print("Remove --keep-entrypoint so earlyoom can run as the foreground process.")
         return 1
 
     # Determine copy targets for build/model distribution.
@@ -1313,6 +1330,10 @@ Examples:
             cmd_parts.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd_parts.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd_parts.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd_parts.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd_parts.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1398,6 +1419,10 @@ Examples:
             cmd.append("--no-cache-dirs")
         if args.keep_entrypoint:
             cmd.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd.append("--non-privileged")
         if args.mem_limit_gb:

@@ -183,6 +183,7 @@ test_non_default_gpu_arch_uses_wheel_build() {
     run_build --gpu-arch 12.0f || fail "non-default gpu arch run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
     assert_log_contains '^docker build -t vllm-node '
+    assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_120,code=sm_120'
     pass "non-default gpu arch uses wheel build path"
 }
 
@@ -191,7 +192,8 @@ test_use_wheels_uses_wheel_build() {
     run_build --use-wheels || fail "--use-wheels run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
     assert_log_contains '^docker build -t vllm-node '
-    pass "--use-wheels preserves wheel build path"
+    assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_121,code=sm_121'
+    pass "--use-wheels preserves wheel build path with default NCCL gencode"
 }
 
 test_cleanup_stays_prebuilt() {

@@ -3,6 +3,7 @@
 # Limit build parallelism to reduce OOM situations
 ARG BUILD_JOBS=16
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+ARG NCCL_NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"
 
 # =========================================================
 # STAGE 1: Base Build Image
@@ -72,6 +73,7 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda-13.3/compat:${LD_LIBRARY_PATH}
 # 2. Set Environment Variables
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ARG NCCL_NVCC_GENCODE
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 # Setup Workspace
@@ -79,11 +81,11 @@ WORKDIR $VLLM_BASE_DIR
 
 # Build NCCL with mesh support (TODO: only do it if arch is 12.1) - artifacts will be in /workspace/nccl/build/pkg/deb
 # RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
-#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="${NCCL_NVCC_GENCODE}" && \
 #     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
 RUN git clone https://github.com/NVIDIA/nccl.git && \
-    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
+    cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="${NCCL_NVCC_GENCODE}" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./build/pkg/deb/*.deb
 
 # =========================================================
@@ -270,10 +272,9 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 WORKDIR $VLLM_BASE_DIR/vllm
 
 # Temporary upstream fixes carried until they are present in the pinned vLLM ref.
-# See https://github.com/vllm-project/vllm/pull/47445
 # See https://github.com/vllm-project/vllm/pull/47392
 # See https://github.com/vllm-project/vllm/pull/47618
-ARG VLLM_PRESET_PRS="47445 47392 47618"
+ARG VLLM_PRESET_PRS="47392 47618"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
@@ -315,10 +316,92 @@ RUN set -eux; \
                     continue; \
                 fi; \
                 rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                if ! git merge pr-${pr} --no-edit; then \
+                    conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                    code_conflicts=""; \
+                    for conflict_file in $conflict_files; do \
+                        case "$conflict_file" in \
+                            tests/*|docs/*|*.md|*.rst) ;; \
+                            *) code_conflicts="${code_conflicts:+$code_conflicts }$conflict_file";; \
+                        esac; \
+                    done; \
+                    if [ -z "$conflict_files" ]; then \
+                        echo "PR #$pr merge failed without unmerged files."; \
+                        git merge --abort || true; \
+                        exit 1; \
+                    fi; \
+                    if [ -n "$code_conflicts" ]; then \
+                        echo "PR #$pr has code merge conflicts: $code_conflicts"; \
+                        git merge --abort || true; \
+                        exit 1; \
+                    fi; \
+                    echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
+                    for conflict_file in $conflict_files; do \
+                        git checkout --ours -- "$conflict_file"; \
+                        git add "$conflict_file"; \
+                    done; \
+                    if git diff --cached --quiet; then \
+                        echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
+                        git merge --abort; \
+                    else \
+                        git commit --no-edit; \
+                    fi; \
+                fi; \
             fi; \
         done; \
     fi
+
+# TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
+# treating non-bool causal as Mapping[int, bool]. DiffusionGemma passes a
+# per-request torch.Tensor causal mask and crashes on causal.get(...). Keep this
+# until upstream build_attn_metadata accepts Tensor causal again.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/v1/worker/gpu/attn_utils.py")
+bad_signature = "causal: bool | Mapping[int, bool] = True,"
+fixed_signature = "causal: bool | Mapping[int, bool] | torch.Tensor = True,"
+bad_group_causal = (
+    "        group_causal = causal if isinstance(causal, bool) else "
+    "causal.get(i, True)"
+)
+fixed_group_causal = """        if isinstance(causal, (bool, torch.Tensor)):
+            group_causal = causal
+        else:
+            group_causal = causal.get(i, True)"""
+
+if not target.exists():
+    raise SystemExit(f"{target} not found; cannot apply DiffusionGemma causal patch")
+
+text = target.read_text()
+if fixed_signature in text and fixed_group_causal in text:
+    print("DiffusionGemma Tensor causal workaround already present; skipping")
+elif bad_signature in text and bad_group_causal in text:
+    text = text.replace(bad_signature, fixed_signature, 1)
+    text = text.replace(bad_group_causal, fixed_group_causal, 1)
+    target.write_text(text)
+    print("Applied DiffusionGemma Tensor causal workaround for vLLM PR #47914")
+else:
+    print("Known vLLM PR #47914 causal regression pattern not found; skipping")
+PY
+
+# TEMPORARY PATCH: vLLM PR #43957 added a generic embedding-width guard for
+# EAGLE3, but Gemma4 MTP intentionally replaces its draft embedding with the
+# target backbone embedding before pre_projection. Without sharing, Gemma4 MTP
+# concatenates 1024-wide draft embeddings with 2816-wide backbone hidden states
+# and crashes in a 5632-wide pre_projection. Keep the guard scoped to EAGLE-style
+# draft models until upstream fixes https://github.com/vllm-project/vllm/issues/47794.
+RUN patch -p1 <<'PATCH'
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1472,4 +1472,4 @@ class SpecDecodeBaseProposer:
+-            if share_embeddings:
++            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
+                 draft_embed = self.model.model.embed_tokens
+                 # Only share when both models use the same embedding width.
+                 # Guard with isinstance so non-Tensor weights (e.g. in tests)
+PATCH
 
 # TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
 # for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with
@@ -726,7 +809,7 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     python3 python3-pip python3-dev vim curl git wget \
     libcudnn9-cuda-13 \
     libibverbs1 libibverbs-dev rdma-core \
-    libxcb1 \
+    libxcb1 earlyoom \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades --allow-change-held-packages ./*.deb \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv

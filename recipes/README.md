@@ -208,6 +208,8 @@ Launch options:
   -j N                        Number of parallel build jobs
   --no-cache-dirs             Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton
   --keep-entrypoint           Keep the Docker image entrypoint
+  --earlyoom                  Run earlyoom as the container foreground process
+  --earlyoom-args ARGS        Arguments passed to earlyoom
   --non-privileged            Run container without --privileged
   --mem-limit-gb N            Memory limit in GB (only with --non-privileged)
   --mem-swap-limit-gb N       Memory+swap limit in GB (only with --non-privileged)
@@ -220,6 +222,13 @@ Extra vLLM arguments:
 Other:
   --dry-run                   Show what would be executed
   --list, -l                  List available recipes
+```
+
+`--earlyoom` uses the same optional monitor as `launch-cluster.sh`. The default arguments are `-M 524288,102400 -s 100 -r 60`; override them with `--earlyoom-args "..."` or `VLLM_SPARK_EARLYOOM_ARGS`. `-M` values are KiB, so the default sends SIGTERM below 512 MiB available memory and SIGKILL below 100 MiB. For example:
+
+```bash
+./run-recipe.sh minimax-m2-awq --solo \
+  --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120"
 ```
 
 ## Extra vLLM Arguments
