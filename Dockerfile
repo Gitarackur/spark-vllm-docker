@@ -123,6 +123,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${FLASHINFER_REF} 2>/dev/null || git checkout ${FLASHINFER_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -133,30 +134,65 @@ WORKDIR /workspace/flashinfer
 
 ARG FLASHINFER_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to FLASHINFER_REF.
 RUN set -eux; \
+    FLASHINFER_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     if [ -n "$FLASHINFER_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $FLASHINFER_PRS"; \
+        echo "Applying PR patches to FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD): $FLASHINFER_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $FLASHINFER_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $FLASHINFER_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
-            else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for FlashInfer PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/flashinfer-pr-${pr}.patch"; \
+            echo "FlashInfer PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "FlashInfer PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "FlashInfer PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "FlashInfer PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply FlashInfer PR #${pr}"; \
                 fi; \
-                rm -f "$cherry_file"; \
-                git merge pr-${pr} --no-edit; \
+                rm -f "$patch_file"; \
+            else \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                if [ -n "$conflict_files" ]; then \
+                    echo "FlashInfer PR #$pr has patch conflicts: $conflict_files"; \
+                else \
+                    echo "FlashInfer PR #$pr patch failed without unmerged files."; \
+                fi; \
+                rm -f "$patch_file"; \
+                git reset --hard HEAD; \
+                exit 1; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$FLASHINFER_REQUESTED_HEAD" HEAD; then \
+            echo "Requested FlashInfer ref $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final FlashInfer source after PR application: requested $FLASHINFER_REF ($FLASHINFER_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
 # TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
@@ -242,6 +278,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         git fetch origin && \
         git fetch origin --tags --force && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        git reset --hard HEAD && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -278,15 +315,22 @@ ARG VLLM_PRESET_PRS="47392 47618"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 
+# PR refs include the branch history they were developed on. Use upstream main
+# only to identify each PR's patch range, then apply that patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
+    VLLM_REQUESTED_HEAD="$(git rev-parse HEAD)"; \
     case "$VLLM_APPLY_PRESET_PRS" in \
         1|true|TRUE|yes|YES) VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS";; \
         0|false|FALSE|no|NO) VLLM_SELECTED_PRESET_PRS="";; \
         ""|auto|AUTO) \
             if [ -z "$VLLM_PRS" ]; then \
-                VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                if [ "$VLLM_REF" = "main" ]; then \
+                    VLLM_SELECTED_PRESET_PRS="$VLLM_PRESET_PRS"; \
+                else \
+                    echo "Skipping preset vLLM PRs in auto mode because VLLM_REF=$VLLM_REF is not main."; \
+                fi; \
             fi;; \
         *) echo "Invalid VLLM_APPLY_PRESET_PRS value: $VLLM_APPLY_PRESET_PRS"; exit 1;; \
     esac; \
@@ -297,58 +341,83 @@ RUN set -eux; \
         esac; \
     done; \
     if [ -n "$VLLM_ALL_PRS" ]; then \
-        # Git requires a user identity to create merge commits
+        # cp -a preserves the source repository's index stat data, but the copied
+        # files have different filesystem identities. Refresh before --index apply.
+        git update-index --refresh; \
         git config --global user.email "builder@example.com"; \
         git config --global user.name "Docker Builder"; \
         \
-        echo "Applying PRs: $VLLM_ALL_PRS"; \
+        echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
+        echo "Fetching origin/main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
+        git fetch origin +refs/heads/main:refs/remotes/origin/main; \
         for pr in $VLLM_ALL_PRS; do \
-            echo "Fetching and merging PR #$pr..."; \
+            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch origin +pull/${pr}/head:pr-${pr}; \
-            if git merge-base --is-ancestor pr-${pr} HEAD; then \
-                echo "PR #$pr is already contained in HEAD; skipping."; \
+            pr_base="$(git merge-base origin/main pr-${pr} || true)"; \
+            if [ -z "$pr_base" ]; then \
+                echo "Unable to find an origin/main merge-base for PR #$pr."; \
+                exit 1; \
+            fi; \
+            patch_file="/tmp/pr-${pr}.patch"; \
+            echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
+            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
+            if [ ! -s "$patch_file" ]; then \
+                echo "PR #$pr has no patch relative to origin/main; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
+                echo "PR #$pr patch is already applied to HEAD; skipping."; \
+                rm -f "$patch_file"; \
+                continue; \
+            fi; \
+            if git apply --3way --index --binary "$patch_file"; then \
+                if git diff --cached --quiet; then \
+                    echo "PR #$pr patch produced no staged changes; skipping."; \
+                else \
+                    git commit -m "Apply vLLM PR #${pr}"; \
+                fi; \
+                rm -f "$patch_file"; \
             else \
-                cherry_file="/tmp/pr-${pr}.cherry"; \
-                git cherry HEAD pr-${pr} > "$cherry_file"; \
-                if ! grep -q '^+' "$cherry_file"; then \
-                    echo "PR #$pr is already patch-equivalent to HEAD; skipping."; \
-                    rm -f "$cherry_file"; \
-                    continue; \
+                conflict_files="$(git diff --name-only --diff-filter=U)"; \
+                code_conflicts=""; \
+                for conflict_file in $conflict_files; do \
+                    case "$conflict_file" in \
+                        tests/*|docs/*|*.md|*.rst) ;; \
+                        *) code_conflicts="${code_conflicts:+$code_conflicts }$conflict_file";; \
+                    esac; \
+                done; \
+                if [ -z "$conflict_files" ]; then \
+                    echo "PR #$pr patch failed without unmerged files."; \
+                    rm -f "$patch_file"; \
+                    git reset --hard HEAD; \
+                    exit 1; \
                 fi; \
-                rm -f "$cherry_file"; \
-                if ! git merge pr-${pr} --no-edit; then \
-                    conflict_files="$(git diff --name-only --diff-filter=U)"; \
-                    code_conflicts=""; \
-                    for conflict_file in $conflict_files; do \
-                        case "$conflict_file" in \
-                            tests/*|docs/*|*.md|*.rst) ;; \
-                            *) code_conflicts="${code_conflicts:+$code_conflicts }$conflict_file";; \
-                        esac; \
-                    done; \
-                    if [ -z "$conflict_files" ]; then \
-                        echo "PR #$pr merge failed without unmerged files."; \
-                        git merge --abort || true; \
-                        exit 1; \
-                    fi; \
-                    if [ -n "$code_conflicts" ]; then \
-                        echo "PR #$pr has code merge conflicts: $code_conflicts"; \
-                        git merge --abort || true; \
-                        exit 1; \
-                    fi; \
-                    echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
-                    for conflict_file in $conflict_files; do \
-                        git checkout --ours -- "$conflict_file"; \
-                        git add "$conflict_file"; \
-                    done; \
-                    if git diff --cached --quiet; then \
-                        echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
-                        git merge --abort; \
-                    else \
-                        git commit --no-edit; \
-                    fi; \
+                if [ -n "$code_conflicts" ]; then \
+                    echo "PR #$pr has code patch conflicts: $code_conflicts"; \
+                    rm -f "$patch_file"; \
+                    git reset --hard HEAD; \
+                    exit 1; \
                 fi; \
+                echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
+                for conflict_file in $conflict_files; do \
+                    git checkout --ours -- "$conflict_file"; \
+                    git add "$conflict_file"; \
+                done; \
+                if git diff --cached --quiet; then \
+                    echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
+                    git reset --hard HEAD; \
+                else \
+                    git commit -m "Apply vLLM PR #${pr}"; \
+                fi; \
+                rm -f "$patch_file"; \
             fi; \
         done; \
+        if ! git merge-base --is-ancestor "$VLLM_REQUESTED_HEAD" HEAD; then \
+            echo "Requested vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD) is not an ancestor of final HEAD $(git rev-parse HEAD) after PR application."; \
+            exit 1; \
+        fi; \
+        echo "Final vLLM source after PR application: requested $VLLM_REF ($VLLM_REQUESTED_HEAD), final $(git describe --tags --always --dirty)."; \
     fi
 
 # TEMPORARY PATCH: vLLM PR #47914 added per-KV-group causal metadata by
@@ -391,17 +460,33 @@ PY
 # concatenates 1024-wide draft embeddings with 2816-wide backbone hidden states
 # and crashes in a 5632-wide pre_projection. Keep the guard scoped to EAGLE-style
 # draft models until upstream fixes https://github.com/vllm-project/vllm/issues/47794.
-RUN patch -p1 <<'PATCH'
-diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
---- a/vllm/v1/spec_decode/llm_base_proposer.py
-+++ b/vllm/v1/spec_decode/llm_base_proposer.py
-@@ -1472,4 +1472,4 @@ class SpecDecodeBaseProposer:
--            if share_embeddings:
-+            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
-                 draft_embed = self.model.model.embed_tokens
-                 # Only share when both models use the same embedding width.
-                 # Guard with isinstance so non-Tensor weights (e.g. in tests)
-PATCH
+RUN python3 - <<'PY'
+from pathlib import Path
+
+target = Path("vllm/v1/spec_decode/llm_base_proposer.py")
+old = """            if share_embeddings:
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+"""
+new = """            if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):
+                draft_embed = self.model.model.embed_tokens
+                # Only share when both models use the same embedding width.
+                # Guard with isinstance so non-Tensor weights (e.g. in tests)
+"""
+
+if not target.exists():
+    print(f"{target} not found; skipping Gemma4 MTP embedding-share workaround")
+else:
+    text = target.read_text()
+    if 'if share_embeddings and hasattr(self.model, "has_own_embed_tokens"):' in text:
+        print("Gemma4 MTP embedding-share workaround already present; skipping")
+    elif old in text:
+        target.write_text(text.replace(old, new, 1))
+        print("Applied Gemma4 MTP embedding-share workaround")
+    else:
+        print("Known Gemma4 MTP embedding-share pattern not found; skipping")
+PY
 
 # TEMPORARY PATCH (source build only): vLLM PR #43008 selects cooperative_topk
 # for all SM90+ devices. On DGX Spark / SM12.x this fails at launch with

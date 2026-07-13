@@ -29,7 +29,7 @@ This repository is not affiliated with NVIDIA or their subsidiaries. This is a c
 By default, `build-and-copy.sh` pulls the tested nightly runner image from DockerHub: `eugr/spark-vllm:latest`. Nightly images are built and tested on multiple models in both cluster and solo configuration before `latest` is advanced.
 We will expand the selection of models we test in the pipeline, but since vLLM is a rapidly developing platform, some things may break.
 
-If you want to build from precompiled vLLM and Flashinfer wheels instead, specify `--use-wheels`. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific vLLM release or commit, set `--vllm-ref`.
+If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific vLLM release or commit, set `--vllm-ref`.
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
@@ -66,7 +66,7 @@ The default image preparation speed depends mostly on your Internet connection a
 
 For slower internet connections it can be faster to build from the precompiled wheels by using `--use-wheels` parameter. An initial build speed depends on your Internet connection speed and whether the base image is already present on your machine. After base image pull, the build should take only 2-3 minutes.
 
-If `--use-wheels`, `--rebuild-vllm`, `--rebuild-flashinfer`, or another build customization is used, the script keeps the local wheel-based build path; full source rebuilds can take 20-40 minutes, but subsequent builds are faster.
+If `--use-wheels`, `--rebuild-vllm`, `--rebuild-flashinfer`, or another build customization is used, the script keeps the local wheel-based runner path. `--use-wheels` by itself only downloads or reuses precompiled wheels; source compilation occurs only for a dependency explicitly selected by a source-build flag. Full source rebuilds can take 20-40 minutes, but subsequent builds are faster.
 
 ### Run
 
@@ -717,11 +717,11 @@ Improved the wheels availability check in `build-and-copy.sh` to be more reliabl
 
 #### Prebuilt vLLM Wheels via GitHub Releases
 
-`build-and-copy.sh` now automatically downloads prebuilt vLLM wheels from the [GitHub releases](https://github.com/eugr/spark-vllm-docker/releases/tag/prebuilt-vllm-current) before falling back to a local build — identical to the existing FlashInfer download mechanism. This eliminates the need to compile vLLM from source on first use.
+`build-and-copy.sh` automatically downloads prebuilt vLLM wheels from the [GitHub releases](https://github.com/eugr/spark-vllm-docker/releases/tag/prebuilt-vllm-current) for wheel-based runner builds. It does not implicitly fall back to a source build.
 
 The download logic mirrors the FlashInfer behaviour:
 - If prebuilt wheels are available and newer than any locally cached version, they are downloaded automatically.
-- If the download fails (e.g. no network, release not found, GPU arch not supported), the script falls back to building locally, or reuses existing local wheels if present.
+- If the download fails (e.g. no network, release not found, GPU arch not supported), the script reuses an existing local wheel when available; otherwise it exits and identifies the explicit source-build flag.
 - `--rebuild-vllm`, `--vllm-ref`, or `--apply-vllm-pr` skip the download entirely and force a local build.
 
 No new flags are required — the download happens transparently.
@@ -772,11 +772,11 @@ Changed reasoning parser in Minimax for better compatibility with modern clients
 
 #### Completely Redesigned Build Process
 
-`build-and-copy.sh` now automatically downloads prebuilt FlashInfer wheels from the [GitHub releases](https://github.com/eugr/spark-vllm-docker/releases/tag/prebuilt-flashinfer-current) before falling back to a local build. This eliminates the need to compile FlashInfer from source on first use, which typically takes around 20 minutes.
+`build-and-copy.sh` automatically downloads prebuilt FlashInfer wheels from the [GitHub releases](https://github.com/eugr/spark-vllm-docker/releases/tag/prebuilt-flashinfer-current) for wheel-based runner builds. It does not implicitly fall back to a source build.
 
 The download logic:
 - If prebuilt wheels are available and newer than any locally cached version, they are downloaded automatically.
-- If the download fails (e.g. no network, release not found, gpu arch is not compatible), the script falls back to building locally, or reuses existing local wheels if present.
+- If the download fails (e.g. no network, release not found, GPU arch is not compatible), the script reuses an existing local wheel when available; otherwise it exits and suggests `--rebuild-flashinfer`.
 - `--rebuild-flashinfer` skips the download entirely and forces a fresh local build.
 
 No new flags are required - the download happens transparently unless `--rebuild-flashinfer` is specified.
@@ -913,9 +913,9 @@ Thanks @raphaelamorim for the contribution!
 
 #### Ability to apply vLLM PRs during build
 
-`./build-and-copy.sh` now supports ability to apply vLLM PRs to builds. PR is applied to the most recent vLLM commit (or specific vllm-ref if set). This does NOT apply to wheels build and MXFP4 special build!
+`./build-and-copy.sh` now supports ability to apply vLLM PRs to builds. PR patches are applied to the selected vLLM ref (`--vllm-ref`, default `main`) without carrying the PR branch's original base history. This does NOT apply to MXFP4 special build!
 
-To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. When custom vLLM PRs are specified, Dockerfile preset vLLM PRs are skipped unless `--apply-preset-vllm-prs` is also specified. Please note that it may fail depending on whether the PR needs a rebase for the specified vLLM reference/main branch. Use with caution!
+To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. Dockerfile preset vLLM PRs are applied automatically for an ordinary `main` source build. Specifying either `--vllm-ref` or `--apply-vllm-pr` suppresses the preset PRs unless `--apply-preset-vllm-prs` is also specified; when enabled, both preset and requested PR patches are applied on top of the selected vLLM ref. Please note that a PR patch may fail if it does not apply cleanly to the selected ref. Use with caution!
 
 Example:
 
@@ -1214,7 +1214,7 @@ Building the container manually is no longer supported due to Dockerfile complex
 
 ### Using the Build Script
 
-The `build-and-copy.sh` script prepares the runner image and optionally copies it to one or more nodes. By default it pulls `eugr/spark-vllm:latest` and tags it locally; use `--use-wheels` or build customization flags when you need a local wheel/source build.
+The `build-and-copy.sh` script prepares the runner image and optionally copies it to one or more nodes. By default it pulls `eugr/spark-vllm:latest` and tags it locally. Use `--use-wheels` to build only the runner from downloaded or local precompiled wheels. Source compilation happens only when an explicit source-build flag such as `--rebuild-vllm`, `--vllm-ref`, `--apply-vllm-pr`, `--rebuild-flashinfer`, `--flashinfer-ref`, or `--apply-flashinfer-pr` is supplied.
 
 **Basic usage (prepare local image):**
 
@@ -1303,7 +1303,7 @@ Using a different username:
 | Flag | Description |
 | :--- | :--- |
 | `-t, --tag <tag>` | Local image tag (default: `vllm-node`; auto-set to `vllm-node-tf5` with `--tf5`, `vllm-node-mxfp4` with `--exp-mxfp4`) |
-| `--use-wheels` | Build the runner image from prebuilt or local wheels instead of pulling `eugr/spark-vllm:latest` |
+| `--use-wheels` | Build only the runner image from downloaded or local precompiled wheels; never implicitly compile missing wheels |
 | `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
@@ -1313,7 +1313,7 @@ Using a different username:
 | `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during build. Can be specified multiple times. |
-| `--apply-preset-vllm-prs` | Also apply Dockerfile preset vLLM PRs when `--apply-vllm-pr` is specified. |
+| `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-ref` or `--apply-vllm-pr` would otherwise suppress them |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
