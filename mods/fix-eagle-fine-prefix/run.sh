@@ -30,4 +30,4 @@ else
   exit 1
 fi
 
-echo "=====> Fine-grained changed-suffix MTP hits enabled; launch vLLM with --prefix-match-unit 16."
+echo "=====> Fine-grained changed-suffix MTP hits enabled; set --prefix-match-unit to a divisor of every KV cache group block size."
