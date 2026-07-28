@@ -1,0 +1,52 @@
+name: Sync upstream backup
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-backup
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out backup repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mirror upstream branches and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add source https://github.com/eugr/spark-vllm-docker.git
+          git fetch --prune source \
+            '+refs/heads/*:refs/remotes/source/*' \
+            '+refs/tags/*:refs/tags/*'
+
+          while IFS= read -r source_ref; do
+            branch="${source_ref#refs/remotes/source/}"
+            git push --force origin \
+              "${source_ref}:refs/heads/upstream-${branch}"
+          done < <(
+            git for-each-ref \
+              --format='%(refname)' \
+              refs/remotes/source
+          )
+
+          git push --force origin 'refs/tags/*:refs/tags/*'
+
+          {
+            echo "### Spark/vLLM backup synchronized"
+            echo
+            echo "- Upstream main: \`$(git rev-parse refs/remotes/source/main)\`"
+            echo "- Backup branch: \`upstream-main\`"
+            echo "- Synchronized: \`$(date -u +'%Y-%m-%dT%H:%M:%SZ')\`"
+          } >> "$GITHUB_STEP_SUMMARY"
