@@ -50,3 +50,59 @@ jobs:
             echo "- Backup branch: \`upstream-main\`"
             echo "- Synchronized: \`$(date -u +'%Y-%m-%dT%H:%M:%SZ')\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mirror current prebuilt wheels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for tag in prebuilt-vllm-current prebuilt-flashinfer-current; do
+            asset_dir="$RUNNER_TEMP/$tag"
+            mkdir -p "$asset_dir"
+
+            gh release download "$tag" \
+              --repo eugr/spark-vllm-docker \
+              --dir "$asset_dir"
+
+            assets=("$asset_dir"/*)
+            if [ "${#assets[@]}" -eq 0 ]; then
+              echo "No upstream assets found for $tag; refusing to alter backup."
+              exit 1
+            fi
+
+            if ! gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release create "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "$tag (upstream backup)" \
+                --notes "Automated backup of eugr/spark-vllm-docker release assets."
+            fi
+
+            gh release upload "$tag" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+
+            while IFS= read -r old_asset; do
+              keep=false
+              for asset in "${assets[@]}"; do
+                if [ "$(basename "$asset")" = "$old_asset" ]; then
+                  keep=true
+                  break
+                fi
+              done
+
+              if [ "$keep" = false ]; then
+                gh release delete-asset "$tag" "$old_asset" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --yes
+              fi
+            done < <(
+              gh release view "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )
+          done
