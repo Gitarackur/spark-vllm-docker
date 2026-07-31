@@ -4,8 +4,12 @@
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+CONTAINER_WORKSPACE_DIR="/workspace"
+CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
+DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -34,19 +38,27 @@ CONFIG_FILE=""  # Will be set to default after argument parsing
 
 ACTIONS_ARG=""
 SOLO_MODE="false"
-NO_RAY_MODE="false"
+NO_RAY_MODE="true"
+NO_RAY_EXPLICIT="false"
+RAY_MODE_EXPLICIT="false"
 LAUNCH_SCRIPT_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
+KEEP_ENTRYPOINT="false"
 MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
+NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
+PORT_MAPPINGS=()
+VOLUME_MAPPINGS=()
+ENABLE_EARLYOOM="false"
+EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [--ray|--no-ray] [-p <host:container>] [-v <local:container>] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
@@ -60,8 +72,14 @@ usage() {
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
-    echo "  --no-ray        No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
-    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton)"
+    echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
+    echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
+    echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
+    echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
+    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
+    echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
+    echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
+    echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  --non-privileged Run in non-privileged mode (removes --privileged and --ipc=host)"
     echo "  --mem-limit-gb  Memory limit in GB (default: 110, only with --non-privileged)"
@@ -72,6 +90,9 @@ usage() {
   --setup/--discover  Force autodiscovery and save configuration (even if .env exists)"
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
+    echo ""
+    echo "Environment overrides:"
+    echo "  VLLM_SPARK_NOFILE_LIMIT  Docker nofile ulimit for containers (default: 1048576)"
     echo ""
     echo "Supported .env file variables:"
     echo "  CLUSTER_NODES       Comma-separated list of node IPs"
@@ -120,10 +141,33 @@ while [[ "$#" -gt 0 ]]; do
             fi
             ;;
         --master-port|--head-port) MASTER_PORT="$2"; shift ;;
+        -p|--publish) PORT_MAPPINGS+=("$2"); shift ;;
+        -p=*|--publish=*) PORT_MAPPINGS+=("${1#*=}") ;;
+        -v|--volume) VOLUME_MAPPINGS+=("$2"); shift ;;
+        -v=*|--volume=*) VOLUME_MAPPINGS+=("${1#*=}") ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
-        --no-ray) NO_RAY_MODE="true" ;;
+        --ray)
+            if [[ "$NO_RAY_EXPLICIT" == "true" ]]; then
+                echo "Error: --ray and --no-ray are mutually exclusive."
+                exit 1
+            fi
+            NO_RAY_MODE="false"
+            RAY_MODE_EXPLICIT="true"
+            ;;
+        --no-ray)
+            if [[ "$RAY_MODE_EXPLICIT" == "true" ]]; then
+                echo "Error: --ray and --no-ray are mutually exclusive."
+                exit 1
+            fi
+            NO_RAY_MODE="true"
+            NO_RAY_EXPLICIT="true"
+            ;;
         --no-cache-dirs) MOUNT_CACHE_DIRS="false" ;;
+        --keep-entrypoint) KEEP_ENTRYPOINT="true" ;;
+        --earlyoom) ENABLE_EARLYOOM="true" ;;
+        --earlyoom-args) ENABLE_EARLYOOM="true"; EARLYOOM_ARGS="$2"; shift ;;
+        --earlyoom-args=*) ENABLE_EARLYOOM="true"; EARLYOOM_ARGS="${1#*=}" ;;
         --non-privileged) NON_PRIVILEGED_MODE="true" ;;
         --mem-limit-gb) MEM_LIMIT_GB="$2"; shift ;;
         --mem-swap-limit-gb) MEM_SWAP_LIMIT_GB="$2"; shift ;;
@@ -283,6 +327,17 @@ else
     done
 fi
 
+if [[ "$ENABLE_EARLYOOM" == "true" && "$KEEP_ENTRYPOINT" == "true" ]]; then
+    echo "Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint."
+    echo "       Remove --keep-entrypoint so earlyoom can run as the foreground process."
+    exit 1
+fi
+
+if ! [[ "$NOFILE_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: VLLM_SPARK_NOFILE_LIMIT must be a positive integer, got: $NOFILE_LIMIT"
+    exit 1
+fi
+
 # Append NCCL_DEBUG if set, with validation
 if [[ -n "$NCCL_DEBUG_VAL" ]]; then
     case "$NCCL_DEBUG_VAL" in
@@ -339,7 +394,17 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # Triton Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.triton:/root/.triton"
     CACHE_DIRS_TO_CREATE+=("$HOME/.triton")
+
+    # TileLang Cache
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
 fi
+
+# Pass user-provided mappings through unchanged so Docker handles its native
+# local_path:container_path[:options] syntax.
+for mapping in "${VOLUME_MAPPINGS[@]}"; do
+    DOCKER_ARGS="$DOCKER_ARGS -v $mapping"
+done
 
 # Resolve launch script path if specified
 if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
@@ -364,7 +429,7 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     echo "Using launch script: $LAUNCH_SCRIPT_PATH"
     
     # Set command to run the copied script (use absolute path since docker exec may not be in /workspace)
-    COMMAND_TO_RUN="/workspace/exec-script.sh"
+    COMMAND_TO_RUN="$CONTAINER_EXEC_SCRIPT"
     LAUNCH_SCRIPT_MODE="true"
 
     # If launch script is specified, default action to exec unless explicitly set to stop/status
@@ -485,9 +550,24 @@ if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
     SOLO_MODE="true"
 fi
 
+if [[ "$SOLO_MODE" == "true" ]]; then
+    if [[ "$RAY_MODE_EXPLICIT" == "true" ]]; then
+        echo "Error: --ray is incompatible with --solo or a single-node configuration."
+        exit 1
+    fi
+    if [[ "$NO_RAY_EXPLICIT" == "true" ]]; then
+        echo "Error: --no-ray is incompatible with --solo or a single-node configuration."
+        exit 1
+    fi
+fi
+
 if [[ "$NO_RAY_MODE" == "true" && "$SOLO_MODE" == "true" ]]; then
-    echo "Warning: Only one node detected; --no-ray has no effect in solo mode. Proceeding normally."
     NO_RAY_MODE="false"
+fi
+
+if [[ ${#PORT_MAPPINGS[@]} -gt 0 && "$SOLO_MODE" != "true" ]]; then
+    echo "Error: -p/--publish port forwarding is only supported in solo mode. Use --solo or remove port mappings for cluster mode."
+    exit 1
 fi
 
 echo "Head Node: $HEAD_IP"
@@ -523,6 +603,11 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
     echo "  Docker Args: $DOCKER_ARGS"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]}"
+    else
+        echo "  Docker Network: host"
+    fi
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
          echo "  Mounting Cache Dirs: ${CACHE_DIRS_TO_CREATE[*]}"
     else
@@ -669,7 +754,7 @@ apply_mod_to_container() {
     fi
 
     # 2. Copy into container
-    local container_dest="/workspace/mods/$mod_name"
+    local container_dest="$CONTAINER_WORKSPACE_DIR/mods/$mod_name"
     
     # Command prefix for remote vs local
     local cmd_prefix=""
@@ -677,8 +762,12 @@ apply_mod_to_container() {
         cmd_prefix="ssh -o BatchMode=yes -o StrictHostKeyChecking=no $node_ip"
     fi
 
-    # Create workspace in container
-    $cmd_prefix docker exec "$container" mkdir -p "$container_dest"
+    # Create workspace in container. Run from / because some images configure
+    # /workspace as WORKDIR but do not create it, which breaks docker exec.
+    $cmd_prefix docker exec -w / "$container" mkdir -p "$container_dest" || {
+        echo "Error: Failed to create $container_dest in container on $node_ip"
+        exit 1
+    }
 
     if [[ "$mod_type" == "zip" ]]; then
         local zip_name=$(basename "$mod_path")
@@ -708,6 +797,9 @@ apply_mod_to_container() {
     # 3. Run run.sh
     echo "  Running patch script on $node_ip..."
 
+    # Preserve the container's default cwd for mods that copy files next to
+    # the eventual vLLM launch. The /workspace creation above only makes that
+    # default cwd safe for images that declare it but do not create it.
     local local_exec_cmd="export WORKSPACE_DIR=\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local remote_exec_cmd="export WORKSPACE_DIR=\\\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local ret_code=0
@@ -758,6 +850,45 @@ parse_parallelism_from_text() {
     done
 }
 
+command_needs_ray_backend() {
+    local text="$1"
+    local serve_re='(^|[[:space:]])vllm[[:space:]]+serve([[:space:]]|$)'
+    local backend_re='--distributed-executor-backend(=|[[:space:]]|$)'
+
+    if [[ "$text" =~ $serve_re ]] && [[ ! "$text" =~ $backend_re ]]; then
+        return 0
+    fi
+    return 1
+}
+
+ensure_ray_backend_command() {
+    local cmd="$1"
+    if command_needs_ray_backend "$cmd"; then
+        echo "Adding --distributed-executor-backend ray for Ray mode." >&2
+        printf '%s --distributed-executor-backend ray' "$cmd"
+    else
+        printf '%s' "$cmd"
+    fi
+}
+
+make_ray_script() {
+    local script_path="$1"
+    local content
+    content=$(cat "$script_path" 2>/dev/null || true)
+
+    if command_needs_ray_backend "$content"; then
+        echo "Adding --distributed-executor-backend ray to launch script for Ray mode." >&2
+        local tmp; tmp=$(mktemp /tmp/vllm_ray_script_XXXXXX.sh)
+        cp "$script_path" "$tmp"
+        sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
+        sed -i "$ s/$/ --distributed-executor-backend ray/" "$tmp"
+        chmod +x "$tmp"
+        echo "$tmp"
+    else
+        echo "$script_path"
+    fi
+}
+
 # Build a patched copy of the launch script on the host for a specific node.
 # Strips --distributed-executor-backend and appends multi-node args.
 # Prints the path of the temp file (caller must delete it).
@@ -768,7 +899,7 @@ make_node_script() {
 
     local tmp; tmp=$(mktemp /tmp/vllm_node_script_XXXXXX.sh)
     # Remove just the flag and its value (not the whole line), then filter empty/backslash-only lines
-    sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//' "$script_path" | \
+    sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g' "$script_path" | \
         grep -Ev '^[[:space:]\\]*$' > "$tmp"
     # Strip trailing backslash from last line before appending multi-node args
     sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
@@ -777,12 +908,30 @@ make_node_script() {
     echo "$tmp"
 }
 
-# Copy a script file into a local container as /workspace/exec-script.sh
+ensure_container_workspace() {
+    local node_ip="$1"; local container="$2"; local is_local="$3"
+
+    if [[ "$is_local" == "true" ]]; then
+        docker exec -w / "$container" mkdir -p "$CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    else
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" \
+            "docker exec -w / $container mkdir -p $CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    fi
+}
+
+# Copy a script file into a local container as $CONTAINER_EXEC_SCRIPT
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
-    docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
-    docker exec "$container" chmod +x /workspace/exec-script.sh
+    ensure_container_workspace "$HEAD_IP" "$container" "true"
+    docker cp "$script_path" "$container:$CONTAINER_EXEC_SCRIPT" || { echo "Error: docker cp to $label failed"; exit 1; }
+    docker exec -w / "$container" chmod +x "$CONTAINER_EXEC_SCRIPT"
 }
 
 # Copy a script file to a remote container via scp + docker cp
@@ -790,10 +939,11 @@ copy_script_to_worker() {
     local worker_ip="$1"; local container="$2"; local script_path="$3"
     echo "Copying launch script to worker $worker_ip..."
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+    ensure_container_workspace "$worker_ip" "$container" "false"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
-         docker exec $container chmod +x /workspace/exec-script.sh && \
+        "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
+         docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
@@ -837,6 +987,61 @@ start_ray_worker() {
           --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
 
+container_keepalive_command() {
+    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+        printf 'earlyoom %s' "$EARLYOOM_ARGS"
+    else
+        printf 'sleep infinity'
+    fi
+}
+
+# Verify that the selected image resolves to the same content-addressable image
+# ID on the head and every worker before starting any containers.
+verify_cluster_image_consistency() {
+    if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo "Verifying Docker image consistency across cluster nodes..."
+
+    local head_image_id
+    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+        echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
+        echo "       Make sure the image exists and is accessible to the current user."
+        return 1
+    fi
+    echo "  [HEAD] $HEAD_IP: $head_image_id"
+
+    local inspect_cmd
+    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+
+    local worker
+    local worker_image_id
+    local image_error=false
+    for worker in "${PEER_NODES[@]}"; do
+        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+            echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
+            echo "       The image may be missing or inaccessible to the remote user."
+            image_error=true
+        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            echo "Error: Docker image mismatch on worker node ($worker):"
+            echo "       Head:   $head_image_id"
+            echo "       Worker: $worker_image_id"
+            image_error=true
+        else
+            echo "  [WORKER] $worker: $worker_image_id (match)"
+        fi
+    done
+
+    if [[ "$image_error" == "true" ]]; then
+        echo "Error: Cluster launch aborted because image '$IMAGE_NAME' is not in sync."
+        printf "       Sync it with: ./build-and-copy.sh --no-build -t %q --copy-to <worker-hosts>\n" "$IMAGE_NAME"
+        return 1
+    fi
+
+    echo "Docker image consistency check passed."
+}
+
 # Start Cluster Function
 start_cluster() {
     check_cluster_running
@@ -845,19 +1050,36 @@ start_cluster() {
         return
     fi
 
+    verify_cluster_image_consistency || exit 1
+
     # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    local docker_entrypoint_args=""
+    if [[ "$KEEP_ENTRYPOINT" != "true" ]]; then
+        docker_entrypoint_args="--entrypoint="
+    fi
+
+    local docker_network_args="--network host"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        docker_network_args=""
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            docker_network_args="$docker_network_args -p $mapping"
+        done
+    fi
+
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         echo "Running in non-privileged mode..."
         docker_caps_args="--cap-add=IPC_LOCK"
-        docker_resource_args="--shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
     else
         docker_caps_args="--privileged"
-        docker_resource_args="--ipc=host"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ipc=host"
     fi
+    local keepalive_cmd
+    keepalive_cmd="$(container_keepalive_command)"
 
     # Start Head Node
     echo "Starting Head Node on $HEAD_IP..."
@@ -867,7 +1089,7 @@ start_cluster() {
         done
     fi
     docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common sleep infinity
+        $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
@@ -876,7 +1098,7 @@ start_cluster() {
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd sleep infinity"
+        ssh "$worker" "$docker_run_cmd $keepalive_cmd"
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)
@@ -909,7 +1131,16 @@ start_cluster() {
                 (( rank++ ))
             done
         else
-            copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
+            local ray_script="$LAUNCH_SCRIPT_PATH"
+            local temp_ray_script=""
+            if [[ "$SOLO_MODE" == "false" ]]; then
+                ray_script=$(make_ray_script "$LAUNCH_SCRIPT_PATH")
+                if [[ "$ray_script" != "$LAUNCH_SCRIPT_PATH" ]]; then
+                    temp_ray_script="$ray_script"
+                fi
+            fi
+            copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            [[ -n "$temp_ray_script" ]] && rm -f "$temp_ray_script"
         fi
     fi
 
@@ -973,7 +1204,7 @@ exec_no_ray_cluster() {
             worker_cmd="$base_cmd"  # script already patched per-node in start_cluster()
         else
             local clean
-            clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+            clean=$(echo "$base_cmd" | sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g')
             worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT --headless"
         fi
         echo "Launching worker (rank $rank) on $worker..."
@@ -990,7 +1221,7 @@ exec_no_ray_cluster() {
         head_cmd="$base_cmd"
     else
         local clean
-        clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+        clean=$(echo "$base_cmd" | sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g')
         head_cmd="$clean --nnodes $total_nodes --node-rank 0 --master-addr $HEAD_IP --master-port $MASTER_PORT"
     fi
 
@@ -1003,6 +1234,10 @@ exec_no_ray_cluster() {
         docker exec $DOCKER_EXEC_FLAGS "$CONTAINER_NAME" bash -c "$head_cmd"
     fi
 }
+
+if [[ "$ACTION" == "exec" && "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then
+    COMMAND_TO_RUN=$(ensure_ray_backend_command "$COMMAND_TO_RUN")
+fi
 
 if [[ "$ACTION" == "exec" ]]; then
     # Trim (or error on) PEER_NODES based on declared parallelism, for any multi-node exec

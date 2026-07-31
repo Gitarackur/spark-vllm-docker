@@ -7,8 +7,12 @@ START_TIME=$(date +%s)
 # Default values
 IMAGE_TAG="vllm-node"
 IMAGE_TAG_SET=false
+PREBUILT_RUNNER_IMAGE="eugr/spark-vllm:latest"
+USE_WHEELS=false
 REBUILD_FLASHINFER=false
 REBUILD_VLLM=false
+FORCE_FLASHINFER_DOWNLOAD=false
+FORCE_VLLM_DOWNLOAD=false
 COPY_HOSTS=()
 COPY_TO_FLAG=false
 SSH_USER="$USER"
@@ -21,11 +25,16 @@ TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_PRS=""
+APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
+# Deprecated --tf5 aliases are kept for tag compatibility only; they no longer alter dependency resolution.
 PRE_TRANSFORMERS=false
 FULL_LOG=false
 BUILD_JOBS="16"
-GPU_ARCH_LIST="12.1a"
+BUILD_JOBS_SET=false
+DEFAULT_GPU_ARCH_LIST="12.1a"
+GPU_ARCH_LIST="$DEFAULT_GPU_ARCH_LIST"
+GPU_ARCH_SET=false
 NETWORK_ARG=""
 WHEELS_REPO="eugr/spark-vllm-docker"
 FLASHINFER_RELEASE_TAG="prebuilt-flashinfer-current"
@@ -51,7 +60,7 @@ generate_build_metadata() {
     local vllm_commit="$3"
     local flashinfer_commit="$4"
     local vllm_ref="$5"
-    local pre_transformers="$6"
+    local transformers_5="$6"
     local exp_mxfp4="$7"
     local vllm_prs="$8"
 
@@ -68,7 +77,7 @@ gpu_arch: ${GPU_ARCH_LIST}
 base_image: ${base_image:-unknown}
 build_args:
   vllm_ref: ${vllm_ref}
-  transformers_5: ${pre_transformers}
+  transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
   build_jobs: ${BUILD_JOBS}
@@ -89,6 +98,21 @@ add_copy_hosts() {
     done
 }
 
+# Convert --gpu-arch value (e.g. 12.0, 12.0f, 12.1a) to NCCL NVCC_GENCODE format.
+gpu_arch_to_nccl_gencode() {
+    local arch="$1"
+    # Strip optional feature suffix (12.1a -> 12.1, 12.0f -> 12.0).
+    arch="${arch%[a-z]}"
+    local sm="${arch//./}"
+    echo "-gencode=arch=compute_${sm},code=sm_${sm}"
+}
+
+get_remote_image_id() {
+    local host="$1"
+    local image="$2"
+    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+}
+
 copy_to_host() {
     local host="$1"
     echo "Loading image into ${SSH_USER}@${host}..."
@@ -104,18 +128,83 @@ copy_to_host() {
     fi
 }
 
-# try_download_wheels TAG PREFIX
+get_local_mtime() {
+    local path="$1"
+    stat -c %Y "$path" 2>/dev/null || stat -f %m "$path"
+}
+
+get_remote_asset_mtime() {
+    local url="$1"
+    curl -fsIL --connect-timeout 10 "$url" | python3 -c '
+import email.utils
+import sys
+
+last_modified = None
+for line in sys.stdin:
+    if line.lower().startswith("last-modified:"):
+        last_modified = line.split(":", 1)[1].strip()
+
+if not last_modified:
+    sys.exit(1)
+
+try:
+    print(int(email.utils.parsedate_to_datetime(last_modified).timestamp()))
+except Exception:
+    sys.exit(1)
+'
+}
+
+local_wheels_are_newer_than_release() {
+    local wheels_dir="$1"
+    local prefix="$2"
+    local release_entries="$3"
+
+    local local_oldest_ts=""
+    local f local_ts
+    for f in "$wheels_dir/${prefix}"*.whl; do
+        [ -f "$f" ] || continue
+        local_ts=$(get_local_mtime "$f" 2>/dev/null || echo 0)
+        if [ -z "$local_oldest_ts" ] || [ "$local_ts" -lt "$local_oldest_ts" ]; then
+            local_oldest_ts="$local_ts"
+        fi
+    done
+
+    if [ -z "$local_oldest_ts" ] || [ "$local_oldest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    local remote_newest_ts=0
+    local url name remote_ts
+    while IFS=' ' read -r url name; do
+        [ -z "$url" ] && continue
+        remote_ts=$(get_remote_asset_mtime "$url" 2>/dev/null || true)
+        if [ -z "$remote_ts" ]; then
+            return 1
+        fi
+        if [ "$remote_ts" -gt "$remote_newest_ts" ]; then
+            remote_newest_ts="$remote_ts"
+        fi
+    done <<< "$release_entries"
+
+    if [ "$remote_newest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    [ "$local_oldest_ts" -ge "$remote_newest_ts" ]
+}
+
+# try_download_wheels TAG PREFIX FORCE_DOWNLOAD
 # Downloads wheels matching PREFIX*.whl from a GitHub release.
-# Skip conditions (either is sufficient):
-#   1. Commit hash in release name matches .wheels/.{PREFIX}_commit (primary check).
-#   2. All local wheels are newer than the latest GitHub asset (freshly built).
-# Only downloads a file when the remote asset is newer than the local copy AND
-# the above skip conditions are not met.
-# On success, persists the release commit hash to .wheels/.{PREFIX}_commit.
+# Uses GitHub release pages and HTTP Last-Modified headers instead of GitHub API metadata.
+# Skips download when exact release assets are current, or when a newer locally
+# built wheel set is present even if its filenames differ from the release.
+# When FORCE_DOWNLOAD is true, downloads every matching release asset.
+# On success, persists the release commit hash to ./wheels/.{PREFIX}-commit.
 # Returns 0 if all matching wheels are now available, 1 on any error.
 try_download_wheels() {
     local TAG="$1"
     local PREFIX="$2"
+    local FORCE_DOWNLOAD="${3:-false}"
     local WHEELS_DIR="./wheels"
 
     local arch
@@ -128,97 +217,127 @@ try_download_wheels() {
         return 1
     fi
 
-    local RELEASE_JSON
-    RELEASE_JSON=$(curl -sf --connect-timeout 10 \
-        "https://api.github.com/repos/$WHEELS_REPO/releases/tags/$TAG") || {
-        echo "Could not fetch release metadata for '$TAG' — skipping download."
+    local RELEASE_ASSETS_HTML
+    RELEASE_ASSETS_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/expanded_assets/$TAG") || {
+        echo "Could not fetch release assets for '$TAG' — skipping download."
         return 1
     }
 
-    local DOWNLOAD_LIST
-    DOWNLOAD_LIST=$(echo "$RELEASE_JSON" | python3 -c '
-import json, sys, os, re
-from datetime import datetime, timezone
+    local RELEASE_ENTRIES
+    RELEASE_ENTRIES=$(printf '%s' "$RELEASE_ASSETS_HTML" | python3 -c '
+import html.parser, os, sys
+from urllib.parse import unquote, urlparse
 
-wheels_dir, prefix = sys.argv[1], sys.argv[2]
-data = json.load(sys.stdin)
-assets = [a for a in data.get("assets", [])
-          if a["name"].startswith(prefix) and a["name"].endswith(".whl")]
+repo, tag, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+asset_path_prefix = "/" + repo + "/releases/download/" + tag + "/"
 
-if not assets:
+class ReleaseAssetParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        attrs = dict(attrs)
+        href = attrs.get("href")
+        if href:
+            self.hrefs.append(href)
+
+parser = ReleaseAssetParser()
+parser.feed(sys.stdin.read())
+
+seen = set()
+for href in parser.hrefs:
+    if not href.startswith(asset_path_prefix):
+        continue
+    name = unquote(os.path.basename(urlparse(href).path))
+    if not name.startswith(prefix) or not name.endswith(".whl"):
+        continue
+    if name in seen:
+        continue
+    seen.add(name)
+    print("https://github.com" + href + " " + name)
+
+if not seen:
     print("No assets found matching prefix: " + prefix, file=sys.stderr)
     sys.exit(1)
+' "$WHEELS_REPO" "$TAG" "$PREFIX") || return 1
 
-# Extract commit hash from the release name:
-#   FlashInfer: "Prebuilt FlashInfer Wheels (0.6.5-124a2d32-d20260305) - DGX Spark Only"
-#   vLLM:       "Prebuilt vLLM Wheels (0.16.1rc1.dev296+ga73af584f.d20260305.cu131) - DGX Spark only"
-release_name = data.get("name", "")
-commit_hash = None
+    local RELEASE_PAGE_HTML REMOTE_COMMIT
+    REMOTE_COMMIT=""
+    if RELEASE_PAGE_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/tag/$TAG"); then
+        REMOTE_COMMIT=$(printf '%s' "$RELEASE_PAGE_HTML" | python3 -c '
+import re, sys
+
+prefix = sys.argv[1]
+html = sys.stdin.read()
+match = None
 if prefix.startswith("flashinfer"):
-    m = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
+    match = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", html, re.IGNORECASE)
 else:
-    m = re.search(r"\+g([0-9a-f]{6,})\.", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
-
-# Compare against the locally stored commit hash
-commit_file = os.path.join(wheels_dir, "." + prefix + "-commit")
-local_commit = None
-if os.path.exists(commit_file):
-    with open(commit_file) as f:
-        local_commit = f.read().strip()
-
-if commit_hash and local_commit and local_commit[:len(commit_hash)] == commit_hash:
-    print("Commit hash matches (" + commit_hash + ") — wheels are up to date.", file=sys.stderr)
-    sys.exit(0)
-
-newest_remote_ts = max(
-    datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
-            .replace(tzinfo=timezone.utc).timestamp()
-    for a in assets
-)
-
-# If local wheels (any version matching prefix) are all newer than the
-# latest GitHub asset, they were freshly built and should not be replaced.
-local_wheels = [
-    os.path.join(wheels_dir, f) for f in os.listdir(wheels_dir)
-    if f.startswith(prefix) and f.endswith(".whl")
-]
-if local_wheels and all(os.path.getmtime(p) >= newest_remote_ts for p in local_wheels):
-    sys.exit(0)
-
-downloads = []
-for a in assets:
-    local_path = os.path.join(wheels_dir, a["name"])
-    remote_ts = datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ") \
-                    .replace(tzinfo=timezone.utc).timestamp()
-    if not os.path.exists(local_path) or remote_ts > os.path.getmtime(local_path):
-        downloads.append(a["browser_download_url"] + " " + a["name"])
-
-if downloads:
-    if commit_hash:
-        print("#commit:" + commit_hash)
-    for d in downloads:
-        print(d)
-' "$WHEELS_DIR" "$PREFIX") || return 1
-
-    if [ -z "$DOWNLOAD_LIST" ]; then
-        echo "All $PREFIX wheels are up to date — skipping download."
-        return 0
+    match = re.search(r"\+g([0-9a-f]{6,})\.", html, re.IGNORECASE)
+if match:
+    print(match.group(1))
+' "$PREFIX")
     fi
 
-    # Parse the optional '#commit:HASH' sentinel emitted by the Python script
-    local REMOTE_COMMIT=""
     local DOWNLOAD_ENTRIES=""
-    while IFS= read -r LINE; do
-        if [[ "$LINE" == "#commit:"* ]]; then
-            REMOTE_COMMIT="${LINE#"#commit:"}"
-        elif [[ -n "$LINE" ]]; then
-            DOWNLOAD_ENTRIES+="$LINE"$'\n'
+    if [ "$FORCE_DOWNLOAD" = true ]; then
+        echo "Force downloading $PREFIX wheels from release '$TAG'..."
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    else
+        local LOCAL_COMMIT=""
+        if [ -f "$WHEELS_DIR/.${PREFIX}-commit" ]; then
+            LOCAL_COMMIT=$(cat "$WHEELS_DIR/.${PREFIX}-commit")
         fi
-    done <<< "$DOWNLOAD_LIST"
+
+        local NEED_DOWNLOAD=false
+        local RELEASE_ASSETS_PRESENT=true
+        local URL NAME
+        while IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            if [ ! -f "$WHEELS_DIR/$NAME" ]; then
+                RELEASE_ASSETS_PRESENT=false
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$RELEASE_ASSETS_PRESENT" = false ]; then
+            if local_wheels_are_newer_than_release "$WHEELS_DIR" "$PREFIX" "$RELEASE_ENTRIES"; then
+                echo "Local $PREFIX wheels are newer than release '$TAG' — skipping download."
+                return 0
+            fi
+            NEED_DOWNLOAD=true
+        fi
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            if [ -n "$REMOTE_COMMIT" ] && [ -n "$LOCAL_COMMIT" ] && [[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT"* ]]; then
+                echo "Commit hash matches ($REMOTE_COMMIT) — wheels are up to date."
+                return 0
+            fi
+        fi
+
+        while [ "$NEED_DOWNLOAD" = false ] && IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            local LOCAL_TS REMOTE_TS
+            LOCAL_TS=$(get_local_mtime "$WHEELS_DIR/$NAME" 2>/dev/null || echo 0)
+            REMOTE_TS=$(get_remote_asset_mtime "$URL" 2>/dev/null || true)
+            if [ -z "$REMOTE_TS" ] || [ "$REMOTE_TS" -gt "$LOCAL_TS" ]; then
+                NEED_DOWNLOAD=true
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            echo "All $PREFIX wheels are up to date — skipping download."
+            return 0
+        fi
+
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    fi
 
     if [ -z "$DOWNLOAD_ENTRIES" ]; then
         echo "All $PREFIX wheels are up to date — skipping download."
@@ -251,6 +370,8 @@ if downloads:
             if compgen -G "$DL_BACKUP/${PREFIX}*.whl" > /dev/null 2>&1; then
                 echo "Restoring previous $PREFIX wheels..."
                 mv "$DL_BACKUP/${PREFIX}"*.whl "$WHEELS_DIR/"
+            fi
+            if compgen -G "$DL_BACKUP/.${PREFIX}*" > /dev/null 2>&1; then
                 mv "$DL_BACKUP/.${PREFIX}"* "$WHEELS_DIR/"
             fi
             rm -rf "$DL_BACKUP"
@@ -269,20 +390,25 @@ if downloads:
 # Help function
 usage() {
     echo "Usage: $0 [OPTIONS]"
-    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
-    echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
+    echo "  -t, --tag <tag>               : Local image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
+    echo "  --use-wheels                  : Build only the runner from precompiled wheels; never implicitly build source."
+    echo "  --gpu-arch <arch>             : GPU architecture for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
+    echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
+    echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
+    echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
-    echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
+    echo "  -c, --copy-to <hosts>         : Host(s) to copy image to. Accepts comma or space-delimited lists; matching remote image IDs are skipped."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
     echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
     echo "  -j, --build-jobs <jobs>       : Number of concurrent build jobs (default: ${BUILD_JOBS})"
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
-    echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
+    echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-ref or --apply-vllm-pr."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
@@ -299,9 +425,16 @@ CONFIG_FILE_SET=false
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -t|--tag) IMAGE_TAG="$2"; IMAGE_TAG_SET=true; shift ;;
-        --gpu-arch) GPU_ARCH_LIST="$2"; shift ;;
+        --use-wheels) USE_WHEELS=true ;;
+        --gpu-arch) GPU_ARCH_LIST="$2"; GPU_ARCH_SET=true; shift ;;
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
+        --force-flashinfer-download) FORCE_FLASHINFER_DOWNLOAD=true ;;
+        --force-vllm-download) FORCE_VLLM_DOWNLOAD=true ;;
+        --force-download)
+            FORCE_FLASHINFER_DOWNLOAD=true
+            FORCE_VLLM_DOWNLOAD=true
+            ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
         --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
@@ -313,7 +446,7 @@ while [[ "$#" -gt 0 ]]; do
             done
             continue
             ;;
-        -j|--build-jobs) BUILD_JOBS="$2"; shift ;;
+        -j|--build-jobs) BUILD_JOBS="$2"; BUILD_JOBS_SET=true; shift ;;
         -u|--user) SSH_USER="$2"; shift ;;
         --copy-parallel) PARALLEL_COPY=true ;;
         --tf5|--pre-tf|--pre-transformers) PRE_TRANSFORMERS=true ;;
@@ -331,6 +464,7 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-preset-vllm-prs) APPLY_PRESET_VLLM_PRS=true ;;
         --apply-flashinfer-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$FLASHINFER_PRS" ]; then
@@ -371,6 +505,11 @@ if [ "$IMAGE_TAG_SET" = false ]; then
     elif [ "$EXP_MXFP4" = true ]; then
         IMAGE_TAG="vllm-node-mxfp4"
     fi
+fi
+
+if [ "$PRE_TRANSFORMERS" = true ]; then
+    echo "Warning: --tf5/--pre-tf/--pre-transformers is deprecated; vLLM now uses Transformers v5 by default."
+    echo "         No Transformers override will be applied; image tag remains $IMAGE_TAG."
 fi
 
 # Source autodiscover.sh to load .env file
@@ -436,6 +575,32 @@ if [ "$NO_BUILD" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+# Select image preparation path. By default, use the tested nightly runner image.
+# Flags that materially change image contents keep the existing local build path.
+VLLM_PR_APPLICATION_REQUESTED=false
+if [ -n "$VLLM_PRS" ] || [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+    VLLM_PR_APPLICATION_REQUESTED=true
+    REBUILD_VLLM=true
+fi
+
+CUSTOM_BUILD_REQUESTED=false
+if [ "$EXP_MXFP4" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$VLLM_REF_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FLASHINFER_REF_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$REBUILD_FLASHINFER" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$REBUILD_VLLM" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FORCE_FLASHINFER_DOWNLOAD" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FORCE_VLLM_DOWNLOAD" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ -n "$VLLM_PRS" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ -n "$FLASHINFER_PRS" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+
+USE_PREBUILT_IMAGE=false
+if [ "$NO_BUILD" = false ] && [ "$USE_WHEELS" = false ] && [ "$CUSTOM_BUILD_REQUESTED" = false ]; then
+    USE_PREBUILT_IMAGE=true
+fi
+
 # Handle cleanup mode
 if [[ "$CLEANUP_MODE" == "true" ]]; then
     WHEELS_DIR="./wheels"
@@ -471,19 +636,41 @@ fi
 COMMON_BUILD_FLAGS+=("--build-arg" "BUILD_JOBS=$BUILD_JOBS")
 COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
+NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "$GPU_ARCH_LIST")"
+COMMON_BUILD_FLAGS+=("--build-arg" "NCCL_NVCC_GENCODE=$NCCL_NVCC_GENCODE")
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi
 
 # =====================================================
-# Build image (unless --no-build or --exp-mxfp4)
+# Prepare image (unless --no-build)
 # =====================================================
 FLASHINFER_BUILD_TIME=0
 VLLM_BUILD_TIME=0
 RUNNER_BUILD_TIME=0
+PREBUILT_PULL_TIME=0
 
 if [ "$NO_BUILD" = false ]; then
-    if [ "$EXP_MXFP4" = true ]; then
+    if [ "$USE_PREBUILT_IMAGE" = true ]; then
+        echo "Using prebuilt runner image ${PREBUILT_RUNNER_IMAGE}..."
+        if [ -n "$NETWORK_ARG" ]; then
+            echo "Warning: --network is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+        if [ "$FULL_LOG" = true ]; then
+            echo "Warning: --full-log is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+        if [ "$BUILD_JOBS_SET" = true ]; then
+            echo "Warning: --build-jobs is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+
+        PULL_START=$(date +%s)
+        docker pull "$PREBUILT_RUNNER_IMAGE"
+        if [ "$IMAGE_TAG" != "$PREBUILT_RUNNER_IMAGE" ]; then
+            docker tag "$PREBUILT_RUNNER_IMAGE" "$IMAGE_TAG"
+        fi
+        PULL_END=$(date +%s)
+        PREBUILT_PULL_TIME=$((PULL_END - PULL_START))
+    elif [ "$EXP_MXFP4" = true ]; then
         echo "Building with experimental MXFP4 support..."
 
         # Generate build metadata YAML for mxfp4 build
@@ -518,13 +705,14 @@ if [ "$NO_BUILD" = false ]; then
                 echo "Rebuilding FlashInfer wheels (--rebuild-flashinfer specified)..."
             fi
             BUILD_FLASHINFER=true
-        elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer"; then
+        elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer" "$FORCE_FLASHINFER_DOWNLOAD"; then
             echo "FlashInfer wheels ready."
         elif compgen -G "./wheels/flashinfer*.whl" > /dev/null 2>&1; then
             echo "Download failed — using existing local FlashInfer wheels."
         else
-            echo "No FlashInfer wheels available (download failed) — building..."
-            BUILD_FLASHINFER=true
+            echo "Error: No precompiled FlashInfer wheels are available and the download failed."
+            echo "       Re-run with --rebuild-flashinfer to explicitly build FlashInfer from source."
+            exit 1
         fi
 
         if [ "$BUILD_FLASHINFER" = true ]; then
@@ -569,29 +757,32 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 2: vLLM wheels
         # ----------------------------------------------------------
-        if [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+        if [ "$VLLM_REF_SET" = true ] || [ "$VLLM_PR_APPLICATION_REQUESTED" = true ]; then
             REBUILD_VLLM=true
         fi
 
         BUILD_VLLM=false
         if [ "$REBUILD_VLLM" = true ]; then
-            if [ "$VLLM_REF_SET" = true ] && [ -n "$VLLM_PRS" ]; then
-                echo "Rebuilding vLLM wheels (--vllm-ref and --apply-vllm-pr specified)..."
+            if [ "$VLLM_REF_SET" = true ] && [ "$VLLM_PR_APPLICATION_REQUESTED" = true ]; then
+                echo "Rebuilding vLLM wheels (applying vLLM PRs to --vllm-ref $VLLM_REF)..."
             elif [ "$VLLM_REF_SET" = true ]; then
                 echo "Rebuilding vLLM wheels (--vllm-ref specified)..."
             elif [ -n "$VLLM_PRS" ]; then
                 echo "Rebuilding vLLM wheels (--apply-vllm-pr specified)..."
+            elif [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                echo "Rebuilding vLLM wheels (--apply-preset-vllm-prs specified)..."
             else
                 echo "Rebuilding vLLM wheels (--rebuild-vllm specified)..."
             fi
             BUILD_VLLM=true
-        elif try_download_wheels "$VLLM_RELEASE_TAG" "vllm"; then
+        elif try_download_wheels "$VLLM_RELEASE_TAG" "vllm" "$FORCE_VLLM_DOWNLOAD"; then
             echo "vLLM wheels ready."
         elif compgen -G "./wheels/vllm*.whl" > /dev/null 2>&1; then
             echo "Download failed — using existing local vLLM wheels."
         else
-            echo "No vLLM wheels available (download failed) — building..."
-            BUILD_VLLM=true
+            echo "Error: No precompiled vLLM wheels are available and the download failed."
+            echo "       Re-run with --rebuild-vllm to explicitly build vLLM from source."
+            exit 1
         fi
 
         if [ "$BUILD_VLLM" = true ]; then
@@ -607,6 +798,17 @@ if [ "$NO_BUILD" = false ]; then
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
                 "--build-arg" "VLLM_REF=$VLLM_REF")
+
+            if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                echo "Applying preset vLLM PRs from the Dockerfile (explicitly requested)."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+            elif [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+                echo "Skipping preset vLLM PRs because --vllm-ref or --apply-vllm-pr was specified."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=0")
+            else
+                echo "Applying preset vLLM PRs from the Dockerfile by default."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+            fi
 
             if [ "$REBUILD_VLLM" = true ]; then
                 VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
@@ -648,16 +850,11 @@ if [ "$NO_BUILD" = false ]; then
         FLASHINFER_COMMIT=""
         [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
-            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS"
+            "$VLLM_REF" "true" "false" "$VLLM_PRS"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
             "${COMMON_BUILD_FLAGS[@]}")
-
-        if [ "$PRE_TRANSFORMERS" = true ]; then
-            echo "Using transformers>=5.0.0..."
-            RUNNER_CMD+=("--build-arg" "PRE_TRANSFORMERS=1")
-        fi
 
         RUNNER_CMD+=(".")
 
@@ -676,41 +873,69 @@ fi
 # =====================================================
 COPY_TIME=0
 if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
-    echo "Copying image '$IMAGE_TAG' to ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
-    if [ "$PARALLEL_COPY" = true ]; then
-        echo "Parallel copy enabled."
-    fi
+    echo "Checking image '$IMAGE_TAG' on ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
     COPY_START=$(date +%s)
 
-    TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
-    echo "Saving image locally to $TMP_IMAGE..."
-    docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
-
-    if [ "$PARALLEL_COPY" = true ]; then
-        PIDS=()
-        for host in "${COPY_HOSTS[@]}"; do
-            copy_to_host "$host" &
-            PIDS+=($!)
-        done
-        COPY_FAILURE=0
-        for pid in "${PIDS[@]}"; do
-            if ! wait "$pid"; then
-                COPY_FAILURE=1
-            fi
-        done
-        if [ "$COPY_FAILURE" -ne 0 ]; then
-            echo "One or more copies failed."
-            exit 1
-        fi
-    else
-        for host in "${COPY_HOSTS[@]}"; do
-            copy_to_host "$host"
-        done
+    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
+        echo "Error: Local image '$IMAGE_TAG' not found."
+        exit 1
     fi
 
-    COPY_END=$(date +%s)
-    COPY_TIME=$((COPY_END - COPY_START))
-    echo "Copy complete."
+    COPY_TARGETS=()
+    for host in "${COPY_HOSTS[@]}"; do
+        REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG" || true)
+        if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
+            echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
+        else
+            if [ -n "$REMOTE_IMAGE_ID" ]; then
+                echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
+            else
+                echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
+            fi
+            COPY_TARGETS+=("$host")
+        fi
+    done
+
+    if [ "${#COPY_TARGETS[@]}" -eq 0 ]; then
+        COPY_END=$(date +%s)
+        COPY_TIME=$((COPY_END - COPY_START))
+        echo "All remote images are up to date; skipping save/copy."
+    else
+        echo "Copying image '$IMAGE_TAG' to ${#COPY_TARGETS[@]} host(s): ${COPY_TARGETS[*]}"
+        if [ "$PARALLEL_COPY" = true ]; then
+            echo "Parallel copy enabled."
+        fi
+
+        TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
+        echo "Saving image locally to $TMP_IMAGE..."
+        docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
+
+        if [ "$PARALLEL_COPY" = true ]; then
+            PIDS=()
+            for host in "${COPY_TARGETS[@]}"; do
+                copy_to_host "$host" &
+                PIDS+=($!)
+            done
+            COPY_FAILURE=0
+            for pid in "${PIDS[@]}"; do
+                if ! wait "$pid"; then
+                    COPY_FAILURE=1
+                fi
+            done
+            if [ "$COPY_FAILURE" -ne 0 ]; then
+                echo "One or more copies failed."
+                exit 1
+            fi
+        else
+            for host in "${COPY_TARGETS[@]}"; do
+                copy_to_host "$host"
+            done
+        fi
+
+        COPY_END=$(date +%s)
+        COPY_TIME=$((COPY_END - COPY_START))
+        echo "Copy complete."
+    fi
 else
     echo "No host specified, skipping copy."
 fi
@@ -724,6 +949,9 @@ echo ""
 echo "========================================="
 echo "         TIMING STATISTICS"
 echo "========================================="
+if [ "$PREBUILT_PULL_TIME" -gt 0 ]; then
+    echo "Prebuilt Pull:    $(printf '%02d:%02d:%02d' $((PREBUILT_PULL_TIME/3600)) $((PREBUILT_PULL_TIME%3600/60)) $((PREBUILT_PULL_TIME%60)))"
+fi
 if [ "$FLASHINFER_BUILD_TIME" -gt 0 ]; then
     echo "FlashInfer Build: $(printf '%02d:%02d:%02d' $((FLASHINFER_BUILD_TIME/3600)) $((FLASHINFER_BUILD_TIME%3600/60)) $((FLASHINFER_BUILD_TIME%60)))"
 fi
@@ -738,4 +966,4 @@ if [ "$COPY_TIME" -gt 0 ]; then
 fi
 echo "Total Time:       $(printf '%02d:%02d:%02d' $((TOTAL_TIME/3600)) $((TOTAL_TIME%3600/60)) $((TOTAL_TIME%60)))"
 echo "========================================="
-echo "Done building $IMAGE_TAG."
+echo "Done preparing $IMAGE_TAG."

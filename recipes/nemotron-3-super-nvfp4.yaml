@@ -21,7 +21,7 @@ defaults:
   port: 8000
   host: 0.0.0.0
   tensor_parallel: 2
-  gpu_memory_utilization: 0.7
+  gpu_memory_utilization: 0.8
   max_model_len: 262144
   max_num_seqs: 10
 
@@ -37,7 +37,7 @@ command: |
   --host {host} \
   --port {port} \
   --enable-auto-tool-choice \
-  --load-format fastsafetensors \
+  --load-format instanttensor \
   --tool-call-parser qwen3_coder \
   --reasoning-parser nemotron_v3 \
   --mamba_ssm_cache_dtype float32 \
