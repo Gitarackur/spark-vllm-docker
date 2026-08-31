@@ -16,10 +16,25 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Require workflow-capable sync token
+        shell: bash
+        env:
+          UPSTREAM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$UPSTREAM_SYNC_TOKEN" ]]; then
+            echo "::error::Configure UPSTREAM_SYNC_TOKEN with Contents and Workflows read/write access to this repository."
+            exit 1
+          fi
+
       - name: Check out backup repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          # The built-in GITHUB_TOKEN cannot update a ref when the incoming
+          # commits create or modify files under .github/workflows/.
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Mirror upstream branches and tags
         shell: bash
