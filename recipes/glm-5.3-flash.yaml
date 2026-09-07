@@ -13,8 +13,7 @@ build_args:
 
 cluster_only: true
 
-mods:
-  - mods/instanttensor-hybrid-draft-loader
+mods: []
 
 defaults:
   port: 8000
@@ -66,7 +65,7 @@ command: |
     --moe-backend b12x \
     --linear-backend b12x \
     --no-enable-flashinfer-autotune \
-    --load-format instanttensor \
+    --load-format b12x \
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \

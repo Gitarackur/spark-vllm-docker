@@ -168,6 +168,12 @@ For periodic maintenance, I recommend using a filter: `docker builder prune --fi
 
 ## CHANGELOG
 
+### 2026-09-06
+
+#### Experimental b12x loader
+
+GLM-5.3 Flash recipe is now using experimental b12x loader that is faster and more memory efficient than Instanttensor on DGX Spark. Also reduced KV-cache memory to 8GB to relax memory pressure. Please note that this recipe and b12x builds in general are still experimental, so please update the repository often to keep everything up to date.
+
 ### 2026-09-05
 
 #### Full GitHub URLs for vLLM PR patches
