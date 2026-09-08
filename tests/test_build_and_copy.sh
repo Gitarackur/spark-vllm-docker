@@ -482,7 +482,13 @@ test_rebuild_vllm_applies_preset_prs_by_default() {
     run_build --rebuild-vllm || fail "--rebuild-vllm run failed"
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
     assert_output_contains 'Applying preset vLLM PRs from the Dockerfile by default\.'
-    pass "ordinary main source rebuild applies preset PRs by default"
+    local preset_prs
+    preset_prs="$(sed -n 's/^ARG VLLM_PRESET_PRS="\([^"]*\)"$/\1/p' "$FIXTURE_DIR/Dockerfile")"
+    case " $preset_prs " in
+        *" 54788 "*) ;;
+        *) fail "regular Dockerfile presets do not include vLLM PR #54788" ;;
+    esac
+    pass "ordinary main source rebuild applies vLLM PR #54788 by default"
 }
 
 test_apply_vllm_pr_skips_preset_prs_by_default() {
@@ -491,6 +497,27 @@ test_apply_vllm_pr_skips_preset_prs_by_default() {
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRS=12345'
     assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
     pass "--apply-vllm-pr suppresses preset PRs by default"
+}
+
+test_apply_vllm_pr_url_is_forwarded_to_source_build() {
+    setup_fixture
+    local pr_url="https://github.com/local-inference-lab/vllm/pull/669"
+
+    run_build --apply-vllm-pr "${pr_url}/" \
+        || fail "full --apply-vllm-pr URL run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRS=https://github.com/local-inference-lab/vllm/pull/669'
+    assert_output_contains 'Applying vLLM PRs: https://github\.com/local-inference-lab/vllm/pull/669'
+    pass "full --apply-vllm-pr URL is normalized and forwarded to the source build"
+}
+
+test_apply_vllm_pr_rejects_invalid_reference() {
+    setup_fixture
+    if run_build --apply-vllm-pr 'https://example.com/example/vllm/pull/1'; then
+        fail "invalid --apply-vllm-pr URL unexpectedly succeeded"
+    fi
+    assert_output_contains 'requires a positive integer PR number or full https://github\.com/OWNER/REPO/pull/NUMBER URL'
+    assert_log_not_contains '^docker build'
+    pass "invalid --apply-vllm-pr reference is rejected before build"
 }
 
 test_apply_vllm_pr_can_apply_preset_prs_explicitly() {
@@ -621,19 +648,19 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     setup_fixture
     run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x --rebuild-vllm run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
-    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/infernal-invocation --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/jovian-judgement --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x .*--build-arg B12X_REPO=https://github.com/lukealonso/b12x.git --build-arg B12X_REF=master '
     assert_log_contains '.*--build-arg B12X_CACHEBUST=[0-9]+'
     assert_log_not_contains 'Dockerfile\.mxfp4'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
-    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/infernal-invocation\.'
+    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/local-inference-lab/vllm ref dev/jovian-judgement\.'
     pass "--exp-b12x --rebuild-vllm uses the B12X source-build profile"
 }
 
 test_exp_b12x_allows_vllm_prs() {
     setup_fixture
     run_build --exp-b12x --apply-vllm-pr 12345 || fail "--exp-b12x with vLLM PR run failed"
-    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=dev/infernal-invocation --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 --build-arg CACHEBUST_VLLM=[0-9]+ --build-arg VLLM_PRS=12345'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=dev/jovian-judgement --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 --build-arg CACHEBUST_VLLM=[0-9]+ --build-arg VLLM_PRS=12345'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset with requested vLLM PRs\)\.\.\.'
     assert_output_contains 'Applying vLLM PRs: 12345'
     pass "--exp-b12x accepts additional vLLM PR patches"
@@ -797,6 +824,110 @@ PY
         fail "B12X C128A patch mutated an unknown source shape"
     fi
     pass "B12X C128A alignment workaround is guarded and idempotent"
+}
+
+test_spark_kv_cache_cleanup_patch_supports_b12x_final_snapshot() {
+    local patch_script="$PROJECT_DIR/docker/patch_vllm_spark_kv_cache_cleanup.py"
+    local legacy_fixture="$TMP_BASE/kv-cleanup-legacy"
+    local b12x_fixture="$TMP_BASE/kv-cleanup-b12x"
+    local unknown_fixture="$TMP_BASE/kv-cleanup-unknown"
+    local target_rel="vllm/v1/worker/gpu_worker.py"
+    local output="$TMP_BASE/kv-cleanup-output.log"
+
+    mkdir -p \
+        "$legacy_fixture/vllm/v1/worker" \
+        "$b12x_fixture/vllm/v1/worker"
+    cat > "$legacy_fixture/$target_rel" <<'PY'
+import torch
+
+
+class Worker:
+    def determine_available_memory(self):
+        free_gpu_memory = profile_result.after_profile.free_memory
+        return free_gpu_memory
+
+    def initialize_from_config(self, kv_cache_config):
+        """Allocate the KV cache."""
+        self.model_runner.initialize_kv_cache(kv_cache_config)
+PY
+    cat > "$b12x_fixture/$target_rel" <<'PY'
+import torch
+
+
+class Worker:
+    def determine_available_memory(self):
+        final_profile_snapshot = MemorySnapshot(device=self.device)
+        late_persistent_memory = max(
+            profile_result.after_profile.free_memory
+            - final_profile_snapshot.free_memory,
+            0,
+        )
+        free_gpu_memory = final_profile_snapshot.free_memory
+        return free_gpu_memory - late_persistent_memory
+
+    def initialize_from_config(self, kv_cache_config):
+        """Allocate the KV cache."""
+        self.model_runner.initialize_kv_cache(kv_cache_config)
+PY
+
+    python3 "$patch_script" "$legacy_fixture" > "$output"
+    python3 "$patch_script" "$b12x_fixture" >> "$output"
+    python3 -m py_compile \
+        "$legacy_fixture/$target_rel" \
+        "$b12x_fixture/$target_rel"
+    python3 - "$legacy_fixture/$target_rel" "$b12x_fixture/$target_rel" <<'PY'
+from pathlib import Path
+import sys
+
+marker = "# spark-vllm-docker: post-profile cleanup before KV sizing"
+prealloc_marker = "# spark-vllm-docker: pre-KV cache allocator cleanup"
+legacy = Path(sys.argv[1]).read_text()
+b12x = Path(sys.argv[2]).read_text()
+
+assert legacy.count(marker) == 1
+assert legacy.count(prealloc_marker) == 1
+assert legacy.index(marker) < legacy.index(
+    "free_gpu_memory = profile_result.after_profile.free_memory"
+)
+
+assert b12x.count(marker) == 1
+assert b12x.count(prealloc_marker) == 1
+assert b12x.index(marker) < b12x.index("final_profile_snapshot = MemorySnapshot")
+assert b12x.index("final_profile_snapshot = MemorySnapshot") < b12x.index(
+    "free_gpu_memory = final_profile_snapshot.free_memory"
+)
+
+for patched in (legacy, b12x):
+    assert patched.count(
+        'if hasattr(profile_result, "transient_peak_headroom"):'
+    ) == 1
+    assert "profile_result.before_create.free_memory" in patched
+    assert "- profile_result.after_profile.free_memory" in patched
+    assert "profile_result.total_consumed" in patched
+    assert "+ profile_result.transient_peak_headroom" in patched
+    assert "# Compatibility with older profiling results." in patched
+PY
+
+    cp "$b12x_fixture/$target_rel" "$b12x_fixture/gpu_worker.once.py"
+    python3 "$patch_script" "$b12x_fixture" >> "$output"
+    if ! cmp -s \
+        "$b12x_fixture/gpu_worker.once.py" \
+        "$b12x_fixture/$target_rel"; then
+        fail "Spark KV cache cleanup patch is not idempotent for the B12X source shape"
+    fi
+
+    cp -a "$b12x_fixture" "$unknown_fixture"
+    sed -i \
+        's/final_profile_snapshot = MemorySnapshot(device=self.device)/final_profile_snapshot = capture_memory()/' \
+        "$unknown_fixture/$target_rel"
+    sed -i '/spark-vllm-docker:/d' "$unknown_fixture/$target_rel"
+    sed -i '/profile_result.after_profile.measure()/d' "$unknown_fixture/$target_rel"
+    sed -i '/diff_from_create.non_torch_memory/d' "$unknown_fixture/$target_rel"
+    if python3 "$patch_script" "$unknown_fixture" >> "$output" 2>&1; then
+        fail "Spark KV cache cleanup patch accepted an unknown profiling snapshot"
+    fi
+
+    pass "Spark KV cache cleanup supports upstream and B12X final-snapshot source shapes"
 }
 
 test_mrv2_speculator_cudagraph_pool_patch_is_guarded_and_idempotent() {
@@ -1221,13 +1352,14 @@ test_dockerfile_fetches_vllm_prs_from_upstream() {
     sed -n '/ARG VLLM_PRS=""/,/# TEMPORARY PATCH: vLLM PR/p' "$PROJECT_DIR/Dockerfile" > "$vllm_pr_block"
     for expected in \
         'git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"' \
-        'git fetch vllm-upstream +pull/${pr}/head:pr-${pr}' \
-        'git merge-base vllm-upstream/main pr-${pr}'; do
+        'git fetch vllm-upstream "+pull/${pr}/head:${pr_head}"' \
+        'git merge-base vllm-upstream/main "$pr_head"' \
+        'curl -fsSL --retry 3 --retry-delay 1 "${pr_url}.diff" -o "$patch_file"'; do
         if ! grep -Fq "$expected" "$vllm_pr_block"; then
-            fail "vLLM PR block does not use the dedicated upstream remote: $expected"
+            fail "vLLM PR block is missing reference-specific fetch logic: $expected"
         fi
     done
-    pass "vLLM PR patches are fetched from upstream when building a fork"
+    pass "vLLM PR patches use upstream for numbers and the named repository for URLs"
 }
 
 test_dockerfile_externalizes_vllm_source_patches() {
@@ -1290,6 +1422,8 @@ test_requested_flashinfer_prs_apply_to_selected_ref
 test_rebuild_vllm_applies_preset_prs_by_default
 test_vllm_ref_skips_preset_prs_by_default
 test_apply_vllm_pr_skips_preset_prs_by_default
+test_apply_vllm_pr_url_is_forwarded_to_source_build
+test_apply_vllm_pr_rejects_invalid_reference
 test_apply_vllm_pr_can_apply_preset_prs_explicitly
 test_vllm_ref_can_apply_preset_prs_explicitly
 test_apply_preset_prs_forces_vllm_rebuild
@@ -1311,6 +1445,7 @@ test_exp_b12x_preserves_blackwell_arches
 test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch
 test_exp_b12x_rebuilds_mismatched_cached_vllm_arch
 test_b12x_c128a_alignment_patch_is_guarded_and_idempotent
+test_spark_kv_cache_cleanup_patch_supports_b12x_final_snapshot
 test_mrv2_speculator_cudagraph_pool_patch_is_guarded_and_idempotent
 test_dockerfile_preserves_selected_blackwell_target
 test_custom_torch_versions_are_forwarded

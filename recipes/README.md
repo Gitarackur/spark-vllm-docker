@@ -140,6 +140,7 @@ The `build_args` field passes flags to `build-and-copy.sh`:
 | Flag | Description |
 |------|-------------|
 | `--exp-mxfp4` | Use MXFP4 Dockerfile (for MXFP4 quantized models) |
+| `--exp-b12x` | Use the B12X image profile, which defaults to the `vllm-node-b12x` tag |
 | `--use-wheels` | Build the runner image from prebuilt or local wheels instead of pulling `eugr/spark-vllm:latest` |
 
 ### Parameter Substitution
@@ -197,8 +198,8 @@ Launch options:
   --name NAME                 Override container name
   --nccl-debug LEVEL          NCCL debug level (VERSION, WARN, INFO, TRACE)
   --apply-mod PATH            Apply an extra mod directory or zip (repeatable)
-  --apply-vllm-pr PR          Apply an upstream PR to installed vLLM (repeatable,
-                              runtime-only, ordered with --apply-mod)
+  --apply-vllm-pr PR_OR_URL   Apply a vLLM PR number or full GitHub PR URL
+                              (repeatable, runtime-only, ordered with --apply-mod)
   -p, --publish HOST:CONTAINER
                               Publish a container port in solo mode (repeatable)
   -v, --volume LOCAL:CONTAINER
@@ -237,6 +238,9 @@ Other:
 
 `--apply-vllm-pr` is a launch option, including when combined with `--setup`.
 It creates an ephemeral runtime mod and does not pass the PR to the image build.
+Bare numbers select PRs from `vllm-project/vllm`. A full public
+`https://github.com/OWNER/REPO/pull/NUMBER` URL downloads the PR from the named
+repository instead.
 It accepts Python/package-only changes under `vllm/`; tests, docs, CI files,
 and `setup.py` are ignored. The container must already provide dependencies
 declared by an ignored `setup.py` change. PRs that modify native code or other
@@ -247,7 +251,7 @@ Recipe-declared mods are applied first, then command-line `--apply-mod` and
 ```bash
 ./run-recipe.sh my-recipe --solo \
   --apply-mod mods/use-official-vllm \
-  --apply-vllm-pr 12345 \
+  --apply-vllm-pr https://github.com/local-inference-lab/vllm/pull/669 \
   --apply-mod mods/my-followup-fix
 ```
 

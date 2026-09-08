@@ -70,7 +70,7 @@ usage() {
     echo "  -j              Number of parallel jobs for build environment variables (optional)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
-    echo "  --apply-vllm-pr Apply an upstream vLLM PR to the installed runtime package before launch (Can be specified multiple times)"
+    echo "  --apply-vllm-pr Apply a vLLM PR number or full GitHub PR URL to the installed runtime package before launch (Can be specified multiple times)"
     echo "  --launch-script Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
@@ -129,6 +129,48 @@ usage() {
     exit 1
 }
 
+normalize_vllm_pr_reference() {
+    local value="$1"
+
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if [[ "$value" =~ ^https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/pull/[1-9][0-9]*/?$ ]]; then
+        printf '%s\n' "${value%/}"
+        return 0
+    fi
+
+    return 1
+}
+
+vllm_pr_label() {
+    local reference="$1"
+    if [[ "$reference" =~ ^[1-9][0-9]*$ ]]; then
+        printf '#%s\n' "$reference"
+    else
+        printf '%s\n' "$reference"
+    fi
+}
+
+vllm_pr_slug() {
+    local reference="$1"
+    if [[ "$reference" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$reference"
+        return 0
+    fi
+
+    local path="${reference#https://github.com/}"
+    local owner="${path%%/*}"
+    path="${path#*/}"
+    local repository="${path%%/*}"
+    local number="${reference##*/}"
+    local digest
+    digest="$(printf '%s' "$reference" | sha256sum | cut -c1-12)"
+    printf '%s-%s-%s-%s\n' "$owner" "$repository" "$number" "$digest"
+}
+
 # Parse arguments
 while [[ "$#" -gt 0 ]]; do
     case $1 in
@@ -141,11 +183,15 @@ while [[ "$#" -gt 0 ]]; do
         -j) BUILD_JOBS="$2"; shift ;;
         --apply-mod) MOD_PATHS+=("$2"); MOD_TYPES+=("path"); shift ;;
         --apply-vllm-pr)
-            if [[ -z "${2:-}" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
-                echo "Error: --apply-vllm-pr requires a positive integer PR number."
+            VLLM_PR_REFERENCE=""
+            if [[ -n "${2:-}" ]]; then
+                VLLM_PR_REFERENCE="$(normalize_vllm_pr_reference "$2")"
+            fi
+            if [[ -z "$VLLM_PR_REFERENCE" ]]; then
+                echo "Error: --apply-vllm-pr requires a positive integer PR number or full https://github.com/OWNER/REPO/pull/NUMBER URL."
                 exit 1
             fi
-            MOD_PATHS+=("$2")
+            MOD_PATHS+=("$VLLM_PR_REFERENCE")
             MOD_TYPES+=("vllm-pr")
             VLLM_PRS_REQUESTED="true"
             shift
@@ -757,11 +803,18 @@ check_cluster_running() {
 }
 
 download_vllm_pr_diff() {
-    local pr_number="$1"
+    local pr_reference="$1"
     local destination="$2"
-    local url="https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/${pr_number}.diff"
+    local label
+    label="$(vllm_pr_label "$pr_reference")"
+    local url
+    if [[ "$pr_reference" =~ ^[1-9][0-9]*$ ]]; then
+        url="https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/${pr_reference}.diff"
+    else
+        url="${pr_reference}.diff"
+    fi
 
-    echo "Fetching upstream vLLM PR #${pr_number}..."
+    echo "Fetching vLLM PR ${label}..."
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$destination"
     elif command -v wget >/dev/null 2>&1; then
@@ -772,23 +825,23 @@ download_vllm_pr_diff() {
     fi
 
     if [[ ! -s "$destination" ]]; then
-        echo "Error: Downloaded patch for vLLM PR #${pr_number} is empty." >&2
+        echo "Error: Downloaded patch for vLLM PR ${label} is empty." >&2
         return 1
     fi
 }
 
 validate_vllm_runtime_diff() {
-    local pr_number="$1"
+    local pr_label="$1"
     local patch_file="$2"
 
-    python3 - "$pr_number" "$patch_file" <<'PY'
+    python3 - "$pr_label" "$patch_file" <<'PY'
 from __future__ import annotations
 
 import shlex
 import sys
 from pathlib import Path
 
-pr_number = sys.argv[1]
+pr_label = sys.argv[1]
 patch_file = Path(sys.argv[2])
 runtime_paths: set[str] = set()
 ignored_paths: set[str] = set()
@@ -828,11 +881,11 @@ for line in patch_file.read_text(errors="replace").splitlines():
         fields = shlex.split(line)
     except ValueError as exc:
         raise SystemExit(
-            f"Error: Could not parse vLLM PR #{pr_number} diff header: {exc}"
+            f"Error: Could not parse vLLM PR {pr_label} diff header: {exc}"
         ) from exc
     if len(fields) != 4:
         raise SystemExit(
-            f"Error: Unexpected vLLM PR #{pr_number} diff header: {line}"
+            f"Error: Unexpected vLLM PR {pr_label} diff header: {line}"
         )
 
     for raw_path in fields[2:4]:
@@ -860,19 +913,19 @@ for line in patch_file.read_text(errors="replace").splitlines():
 if unsupported_paths:
     rendered = "\n  - ".join(sorted(unsupported_paths))
     raise SystemExit(
-        f"Error: vLLM PR #{pr_number} is not runtime-only. It changes files that "
+        f"Error: vLLM PR {pr_label} is not runtime-only. It changes files that "
         f"require a source build or cannot be installed safely at launch:\n  - {rendered}\n"
-        f"Use build-and-copy.sh --apply-vllm-pr {pr_number} instead."
+        f"Use build-and-copy.sh --apply-vllm-pr {pr_label.lstrip('#')} instead."
     )
 
 if not runtime_paths:
     raise SystemExit(
-        f"Error: vLLM PR #{pr_number} has no applicable files under vllm/. "
+        f"Error: vLLM PR {pr_label} has no applicable files under vllm/. "
         f"Use the build-time --apply-vllm-pr path if the PR is still required."
     )
 
 print(
-    f"Validated vLLM PR #{pr_number} for runtime application: "
+    f"Validated vLLM PR {pr_label} for runtime application: "
     f"{len(runtime_paths)} package path(s), "
     f"{len(ignored_paths)} non-runtime path(s) ignored."
 )
@@ -887,10 +940,11 @@ write_vllm_pr_mod_runner() {
 set -euo pipefail
 
 MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PR_NUMBER="$(tr -d '\r\n' < "$MOD_DIR/pr-number")"
+PR_REFERENCE="$(tr -d '\r\n' < "$MOD_DIR/pr-reference")"
+PR_LABEL="$(tr -d '\r\n' < "$MOD_DIR/pr-label")"
 PATCH_FILE="$MOD_DIR/pr.diff"
 EXPECTED_SHA256="$(tr -d '\r\n' < "$MOD_DIR/pr.sha256")"
-PREFIX="[vllm-pr #${PR_NUMBER}]"
+PREFIX="[vllm-pr ${PR_LABEL}]"
 
 if ! command -v git >/dev/null 2>&1; then
     echo "$PREFIX git is required to apply this runtime PR." >&2
@@ -943,7 +997,7 @@ elif git apply --check "${APPLY_ARGS[@]}" "$PATCH_FILE"; then
     echo "$PREFIX Applied successfully."
 else
     echo "$PREFIX Patch does not apply cleanly to the installed vLLM package." >&2
-    echo "$PREFIX Rebuild with build-and-copy.sh --apply-vllm-pr $PR_NUMBER if this PR is not runtime-compatible." >&2
+    echo "$PREFIX Rebuild with build-and-copy.sh --apply-vllm-pr $PR_REFERENCE if this PR is not runtime-compatible." >&2
     exit 1
 fi
 RUN_SH
@@ -968,19 +1022,23 @@ prepare_vllm_pr_mods() {
             continue
         fi
 
-        local pr_number="${MOD_PATHS[$i]}"
-        local bundle_dir="$GENERATED_MOD_ROOT/vllm-pr-${pr_number}-${i}"
+        local pr_reference="${MOD_PATHS[$i]}"
+        local pr_label
+        pr_label="$(vllm_pr_label "$pr_reference")"
+        local pr_slug
+        pr_slug="$(vllm_pr_slug "$pr_reference")"
+        local bundle_dir="$GENERATED_MOD_ROOT/vllm-pr-${pr_slug}-${i}"
         local patch_file="$bundle_dir/pr.diff"
-        local cached_patch="$cache_dir/pr-${pr_number}.diff"
-        local cached_sha256="$cache_dir/pr-${pr_number}.sha256"
+        local cached_patch="$cache_dir/pr-${pr_slug}.diff"
+        local cached_sha256="$cache_dir/pr-${pr_slug}.sha256"
         mkdir -p "$bundle_dir"
 
         if [[ ! -f "$cached_patch" ]]; then
-            if ! download_vllm_pr_diff "$pr_number" "$cached_patch"; then
+            if ! download_vllm_pr_diff "$pr_reference" "$cached_patch"; then
                 cleanup_generated_mods
                 return 1
             fi
-            if ! validate_vllm_runtime_diff "$pr_number" "$cached_patch"; then
+            if ! validate_vllm_runtime_diff "$pr_label" "$cached_patch"; then
                 cleanup_generated_mods
                 return 1
             fi
@@ -996,11 +1054,12 @@ PY
         local patch_sha256
         patch_sha256="$(tr -d '\r\n' < "$cached_sha256")"
         cp "$cached_patch" "$patch_file"
-        printf '%s\n' "$pr_number" > "$bundle_dir/pr-number"
+        printf '%s\n' "$pr_reference" > "$bundle_dir/pr-reference"
+        printf '%s\n' "$pr_label" > "$bundle_dir/pr-label"
         printf '%s\n' "$patch_sha256" > "$bundle_dir/pr.sha256"
         write_vllm_pr_mod_runner "$bundle_dir/run.sh"
 
-        echo "Prepared runtime vLLM PR #${pr_number} (SHA-256: ${patch_sha256})."
+        echo "Prepared runtime vLLM PR ${pr_label} (SHA-256: ${patch_sha256})."
         MOD_PATHS[$i]="$bundle_dir"
         MOD_TYPES[$i]="dir"
     done

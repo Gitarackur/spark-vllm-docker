@@ -135,7 +135,7 @@ To launch the model:
   --gpu-memory-utilization 0.8 \
   -tp 2 \
   --max-model-len 128000 \
-  --load-format fastsafetensors \
+  --load-format instanttensor \
   --enable-auto-tool-choice --tool-call-parser minimax_m2 \
   --reasoning-parser minimax_m2
 ```
@@ -167,6 +167,37 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-09-06
+
+#### Experimental b12x loader
+
+GLM-5.3 Flash recipe is now using experimental b12x loader that is faster and more memory efficient than Instanttensor on DGX Spark. Also reduced KV-cache memory to 8GB to relax memory pressure. Please note that this recipe and b12x builds in general are still experimental, so please update the repository often to keep everything up to date.
+
+### 2026-09-05
+
+#### Full GitHub URLs for vLLM PR patches
+
+All `--apply-vllm-pr` arguments now accept either the existing numeric
+shorthand for `vllm-project/vllm` or a full public GitHub pull-request URL such
+as `https://github.com/local-inference-lab/vllm/pull/669`. Launch-time patches
+download the URL's `.diff` directly; source builds do the same before applying
+the patch to the selected vLLM ref.
+
+### 2026-09-04
+
+#### GLM 5.3 Flash dual-Spark recipe
+
+Added the cluster-only `glm-5.3-flash` recipe for serving
+`local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` on two DGX Spark nodes. It uses the B12X container with MTP and 1M context.
+
+For a first-time cluster setup, discover the nodes and then let the recipe
+prepare and distribute the B12X image and model:
+
+```bash
+./run-recipe.sh --discover
+./run-recipe.sh glm-5.3-flash --setup
+```
 
 ### 2026-08-27
 
@@ -1088,12 +1119,23 @@ Thanks @raphaelamorim for the contribution!
 
 `./build-and-copy.sh` now supports ability to apply vLLM PRs to builds. PR patches are applied to the selected vLLM ref (`--vllm-ref`, default `main`) without carrying the PR branch's original base history. This does NOT apply to MXFP4 special build!
 
-To use, just specify `--apply-vllm-pr <pr_num>` in the arguments. Dockerfile preset vLLM PRs are applied automatically for an ordinary `main` source build. Specifying either `--vllm-ref` or `--apply-vllm-pr` suppresses the preset PRs unless `--apply-preset-vllm-prs` is also specified; when enabled, both preset and requested PR patches are applied on top of the selected vLLM ref. Please note that a PR patch may fail if it does not apply cleanly to the selected ref. Use with caution!
+To use, specify `--apply-vllm-pr <pr-or-url>` in the arguments. A number selects
+that PR from `vllm-project/vllm`; a full
+`https://github.com/OWNER/REPO/pull/NUMBER` URL selects the named repository.
+Dockerfile preset vLLM PRs are applied automatically for an ordinary `main`
+source build. Specifying either `--vllm-ref` or `--apply-vllm-pr` suppresses the
+preset PRs unless `--apply-preset-vllm-prs` is also specified; when enabled,
+both preset and requested PR patches are applied on top of the selected vLLM
+ref. A PR patch may fail if it does not apply cleanly to the selected ref. Use
+with caution.
 
 Example:
 
 ```bash
 ./build-and-copy.sh -t vllm-node-20260204-pr31740 --apply-vllm-pr 31740 -c
+
+./build-and-copy.sh --exp-b12x -t vllm-node-b12x-pr669 \
+  --apply-vllm-pr https://github.com/local-inference-lab/vllm/pull/669 -c
 ```
 
 ### 2026-02-02
@@ -1509,7 +1551,7 @@ For the maintained experimental B12X combination, the equivalent shortcut is:
 
 Without local-build flags, this pulls `eugr/spark-vllm-b12x:latest` and tags it
 as `vllm-node-b12x` unless `-t` is supplied. To build the maintained combination
-from `local-inference-lab/vllm@dev/infernal-invocation` and the `master` branch of the
+from `local-inference-lab/vllm@dev/jovian-judgement` and the `master` branch of the
 B12X repository, run:
 
 ```bash
@@ -1573,7 +1615,7 @@ For regular `vllm-project/vllm` builds and any branch, tag, or commit selected f
 | `--torchvision-version <version>` | Optional torchvision version (default: `0.28.0`) |
 | `--torchaudio-version <version>` | Optional torchaudio version (default: `2.11.0`; use `none` to omit it) |
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
-| `--apply-vllm-pr <pr-num>` | Apply a vLLM PR patch during the image build. Can be specified multiple times. This is distinct from the launch-time option accepted by `launch-cluster.sh` and `run-recipe.sh`. |
+| `--apply-vllm-pr <pr-or-url>` | Apply a vLLM PR patch during the image build. Numbers select `vllm-project/vllm`; full `https://github.com/OWNER/REPO/pull/NUMBER` URLs select another public GitHub repository. Repeatable. This is distinct from the launch-time option accepted by `launch-cluster.sh` and `run-recipe.sh`. |
 | `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-repo`, `--vllm-ref`, or `--apply-vllm-pr` would otherwise suppress them |
 | `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
@@ -1764,7 +1806,7 @@ discovered correctly:
 | `-e, --env` | Environment variable to pass to container (e.g. `-e VAR=val`). Can be used multiple times. |
 | `-j` | Number of parallel jobs for build environment variables (optional). |
 | `--apply-mod` | Apply mods/patches from specified directory. Can be used multiple times to apply multiple mods. |
-| `--apply-vllm-pr <pr-num>` | Fetch and apply an upstream vLLM PR to the installed runtime package before launch. Runtime-only; repeatable and ordered with `--apply-mod`. |
+| `--apply-vllm-pr <pr-or-url>` | Fetch and apply a vLLM PR to the installed runtime package before launch. Numbers select `vllm-project/vllm`; full public GitHub PR URLs select their named repository. Runtime-only; repeatable and ordered with `--apply-mod`. |
 | `--nccl-debug` | NCCL debug level (e.g., INFO, WARN). Defaults to INFO if flag is present but value is omitted. |
 | `--check-config` | Check configuration and auto-detection without launching. |
 | `--solo` | Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster |
@@ -2010,11 +2052,12 @@ When using recipes, any mods listed in the recipe are applied first, followed by
 ./run-recipe.sh glm-4.7-flash-awq --solo --apply-mod ./mods/other-mod
 ```
 
-### Applying an Upstream PR at Launch Time
+### Applying a vLLM PR at Launch Time
 
 For Python/package-only vLLM changes, `launch-cluster.sh` can create a temporary
-mod from an upstream PR without rebuilding the image or adding a permanent
-directory under `mods/`:
+mod from a PR without rebuilding the image or adding a permanent directory
+under `mods/`. A bare number selects `vllm-project/vllm`; use a complete public
+GitHub PR URL to select a different repository:
 
 ```bash
 ./launch-cluster.sh --solo \
@@ -2023,6 +2066,9 @@ directory under `mods/`:
 
 ./run-recipe.sh glm-4.7-flash-awq --solo \
   --apply-vllm-pr 12345
+
+./run-recipe.sh deepseek-v4-flash-0731 \
+  --apply-vllm-pr https://github.com/local-inference-lab/vllm/pull/669
 ```
 
 The PR diff is downloaded once on the head node, checksum-logged, and copied to

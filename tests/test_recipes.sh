@@ -823,9 +823,21 @@ test_launch_cmd_cli_apply_vllm_pr_passthrough() {
 
     if "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --apply-vllm-pr invalid > /dev/null 2>&1; then
-        log_fail "Invalid runtime vLLM PR number was accepted"
+        log_fail "Invalid runtime vLLM PR reference was accepted"
     else
-        log_pass "Invalid runtime vLLM PR number is rejected"
+        log_pass "Invalid runtime vLLM PR reference is rejected"
+    fi
+
+    local pr_url="https://github.com/local-inference-lab/vllm/pull/669"
+    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+        --apply-vllm-pr "${pr_url}/" 2>&1)
+    launch_cmd=$(extract_launch_cmd "$output")
+    if echo "$launch_cmd" | grep -Fq -- "--apply-vllm-pr ${pr_url}" \
+        && ! echo "$launch_cmd" | grep -Fq -- "${pr_url}/ "; then
+        log_pass "Full runtime vLLM PR URL is normalized and passed through"
+    else
+        log_fail "Full runtime vLLM PR URL passthrough failed"
+        log_verbose "Launch cmd: $launch_cmd"
     fi
 }
 

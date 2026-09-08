@@ -112,11 +112,22 @@ DISTRIBUTED_EXECUTOR_RE = re.compile(
 )
 
 
-def runtime_vllm_pr_number(value: str) -> str:
-    """Validate an upstream vLLM PR number without accepting URL fragments."""
-    if not re.fullmatch(r"[1-9][0-9]*", value):
-        raise argparse.ArgumentTypeError("must be a positive integer PR number")
-    return value
+def runtime_vllm_pr_reference(value: str) -> str:
+    """Validate a PR number or canonical public GitHub pull-request URL."""
+    if re.fullmatch(r"[1-9][0-9]*", value):
+        return value
+    if re.fullmatch(
+        r"https://github\.com/"
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*/"
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*/"
+        r"pull/[1-9][0-9]*/?",
+        value,
+    ):
+        return value.rstrip("/")
+    raise argparse.ArgumentTypeError(
+        "must be a positive integer PR number or full "
+        "https://github.com/OWNER/REPO/pull/NUMBER URL"
+    )
 
 
 class OrderedLaunchLayerAction(argparse.Action):
@@ -853,11 +864,11 @@ Examples:
     launch_group.add_argument(
         "--apply-vllm-pr",
         action=OrderedLaunchLayerAction,
-        type=runtime_vllm_pr_number,
+        type=runtime_vllm_pr_reference,
         dest="apply_vllm_prs",
         default=[],
-        metavar="PR",
-        help="Apply an upstream vLLM PR to the installed runtime package. Can be used multiple times.",
+        metavar="PR_OR_URL",
+        help="Apply a vLLM PR number or full GitHub PR URL to the installed runtime package. Can be used multiple times.",
     )
     launch_group.add_argument(
         "-p",

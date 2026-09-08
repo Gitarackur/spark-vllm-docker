@@ -61,7 +61,7 @@ MINIMAX_ARGS=(
     "--host 0.0.0.0"
     "--gpu-memory-utilization 0.8"
     "--max-model-len 128000"
-    "--load-format fastsafetensors"
+    "--load-format instanttensor"
     "--enable-auto-tool-choice"
     "--tool-call-parser minimax_m2"
     "--reasoning-parser minimax_m2"

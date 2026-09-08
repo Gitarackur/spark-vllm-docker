@@ -34,7 +34,7 @@ VLLM_SOURCE_STAGING_DIR=""
 VLLM_SOURCE_CONTEXT=""
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
-EXP_B12X_VLLM_REF="dev/infernal-invocation"
+EXP_B12X_VLLM_REF="dev/jovian-judgement"
 B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
 B12X_PACKAGE_REF="master"
 EXP_B12X_TORCH_VERSION="2.13.0"
@@ -621,7 +621,7 @@ usage() {
     echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
-    echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-vllm-pr <pr-or-url>   : Apply a vLLM PR number or full GitHub PR URL to source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
@@ -632,6 +632,22 @@ usage() {
     echo "  --setup                       : Force autodiscovery and save configuration (even if .env exists)"
     echo "  -h, --help                    : Show this help message"
     exit 1
+}
+
+normalize_vllm_pr_reference() {
+    local value="$1"
+
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if [[ "$value" =~ ^https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/pull/[1-9][0-9]*/?$ ]]; then
+        printf '%s\n' "${value%/}"
+        return 0
+    fi
+
+    return 1
 }
 
 # Parse all arguments
@@ -717,15 +733,20 @@ while [[ "$#" -gt 0 ]]; do
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
         --exp-b12x|--experimental-b12x) EXP_B12X=true ;;
         --apply-vllm-pr)
-            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+            VLLM_PR_REFERENCE=""
+            if [ -n "${2:-}" ]; then
+                VLLM_PR_REFERENCE="$(normalize_vllm_pr_reference "$2")" \
+                    || VLLM_PR_REFERENCE=""
+            fi
+            if [ -n "$VLLM_PR_REFERENCE" ]; then
                if [ -n "$VLLM_PRS" ]; then
-                   VLLM_PRS="$VLLM_PRS $2"
+                   VLLM_PRS="$VLLM_PRS $VLLM_PR_REFERENCE"
                else
-                   VLLM_PRS="$2"
+                   VLLM_PRS="$VLLM_PR_REFERENCE"
                fi
                shift
             else
-               echo "Error: --apply-vllm-pr requires a PR number."
+               echo "Error: --apply-vllm-pr requires a positive integer PR number or full https://github.com/OWNER/REPO/pull/NUMBER URL."
                exit 1
             fi
             ;;
