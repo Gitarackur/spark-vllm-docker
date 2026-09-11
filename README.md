@@ -41,6 +41,16 @@ If you want to build only the runner from precompiled vLLM and FlashInfer wheels
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
+Local builds include a CUDA-on-WSL memory-reporting fix in both compiled vLLM
+wheels and runners built with `--use-wheels`. On integrated NVIDIA GPUs under
+WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest
+RAM availability. Native Linux UMA accounting and proactive allocator-cache
+release keep their upstream behavior.
+
+Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
+`-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
+out.
+
 ## QUICK START SHORTCUT
 
 If you are here to run DeepSeek V4 Flash (07/31 version), follow these instructions, otherwise skip to the next section.

@@ -1379,8 +1379,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 13 ]; then
-        fail "Expected 13 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 14 ]; then
+        fail "Expected 14 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
