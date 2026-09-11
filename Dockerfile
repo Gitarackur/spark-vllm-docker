@@ -525,6 +525,14 @@ RUN set -eux; \
 # the fix (idempotent); unknown partial source shapes fail the build.
 COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
 
+# TEMPORARY PATCH: vLLM PR #53007 / d29c88f162a3 chooses a large SWA
+# kernel block even when the backend cannot run the primary block unsplit.
+# On FlashInfer SM12x, 64 does not divide Qwen3.8's 1648-token page, so
+# DFlash2 pages become mostly padding. Preserve the PR's supported-primary
+# path and restore the smallest-block fallback. Remove once supported refs
+# contain an equivalent upstream fix; unexpected source layouts fail closed.
+RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
+
 # TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
 # profiling capture, but only redirects the main graph manager and existing
 # wrappers to its throwaway pool. MTP and other autoregressive speculators own
