@@ -818,11 +818,24 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # regular and B12X builds. B12X kernels remain JIT-compiled on first use;
 # building its Python wheel here does not compile the CUDA kernels.
 COPY docker/pin_cutlass_dsl.py /tmp/pin_cutlass_dsl.py
+# TEMPORARY: restore small-tile W4A8 occupancy until B12X PR #363 is merged.
+# https://github.com/local-inference-lab/b12x/pull/363
+# Bundled from commit 9dc276f8105cfbe2d5882a6475e6e96c9533911c.
+COPY docker/b12x-pr363-small-tile-barriers.patch /tmp/b12x-pr363.patch
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ -n "$B12X_REPO" ]; then \
         echo "Refreshing B12X source (cache key: $B12X_CACHEBUST)" && \
         git clone --depth 1 --branch "$B12X_REF" "$B12X_REPO" /tmp/b12x-source && \
         B12X_COMMIT=$(git -C /tmp/b12x-source rev-parse HEAD) && \
+        if git -C /tmp/b12x-source apply --reverse --check /tmp/b12x-pr363.patch >/dev/null 2>&1; then \
+            echo "B12X PR #363 is already applied; skipping."; \
+        elif git -C /tmp/b12x-source apply --check /tmp/b12x-pr363.patch; then \
+            git -C /tmp/b12x-source apply /tmp/b12x-pr363.patch && \
+            echo "Applied B12X PR #363 small-tile W4A8 barrier specialization."; \
+        else \
+            echo "B12X PR #363 does not match this source; review the temporary patch before building." >&2; \
+            exit 1; \
+        fi && \
         python3 /tmp/pin_cutlass_dsl.py "$CUTLASS_DSL_VERSION" \
             --expected-count 5 /tmp/b12x-source/pyproject.toml && \
         uv pip install --reinstall --no-deps /tmp/b12x-source && \
