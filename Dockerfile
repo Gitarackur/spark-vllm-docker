@@ -851,6 +851,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 COPY docker/patch_vllm_wsl_cuda_uma.py /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py --installed
 
+# Enumerate Torch schema arguments once per fill_defaults call. Apply after all
+# package installs so regular, B12X, and precompiled-wheel runners retain the fix.
+COPY docker/patch_torch_schema_enumeration.py /tmp/torch-patches/patch_torch_schema_enumeration.py
+RUN python3 /tmp/torch-patches/patch_torch_schema_enumeration.py --installed
+
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
     ln -s /usr/lib/aarch64-linux-gnu/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2

@@ -1406,6 +1406,13 @@ test_swa_block_size_patch() {
     pass "SWA block fallback preserves supported primary sizes and is applied only at source build"
 }
 
+test_torch_schema_enumeration_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_torch_schema_enumeration_patch.py"; then
+        fail "Torch schema enumeration regression tests failed"
+    fi
+    pass "Torch schema enumeration preserves defaults and patches the installed runner"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -1476,5 +1483,6 @@ test_dockerfiles_pin_tvm_ffi_regression_version
 test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches
 test_swa_block_size_patch
+test_torch_schema_enumeration_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."
