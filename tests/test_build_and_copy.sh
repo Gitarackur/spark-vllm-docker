@@ -336,10 +336,12 @@ test_use_wheels_uses_wheel_build() {
 test_regular_build_includes_b12x_package() {
     setup_fixture
     run_build --use-wheels || fail "regular B12X package run failed"
-    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/regular .*--build-arg B12X_REPO=https://github.com/lukealonso/b12x.git --build-arg B12X_REF=master '
+    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/regular .*--build-arg B12X_FROM_PYPI=1 '
+    assert_log_not_contains 'B12X_REPO='
+    assert_log_not_contains 'B12X_REF='
     assert_log_contains '.*--build-arg B12X_CACHEBUST=[0-9]+'
-    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/vllm-project/vllm ref main\.'
-    pass "regular upstream vLLM builds include the B12X package"
+    assert_output_contains 'Installing latest B12X from PyPI for https://github\.com/vllm-project/vllm ref main\.'
+    pass "regular upstream vLLM builds install the latest B12X release from PyPI"
 }
 
 test_use_wheels_never_falls_back_to_source() {
@@ -561,6 +563,7 @@ test_custom_vllm_repo_forces_source_build() {
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main --build-arg VLLM_REPO=https://github.com/example/vllm.git --build-arg VLLM_APPLY_PRESET_PRS=0'
     assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/custom '
     assert_log_not_contains 'B12X_REPO='
+    assert_log_not_contains 'B12X_FROM_PYPI=1'
     assert_log_not_contains 'VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
     assert_output_contains 'Rebuilding vLLM wheels \(--vllm-repo specified\)\.\.\.'
     assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
@@ -650,6 +653,7 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
     assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/jovian-judgement --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x .*--build-arg B12X_REPO=https://github.com/lukealonso/b12x.git --build-arg B12X_REF=master '
+    assert_log_not_contains 'B12X_FROM_PYPI=1'
     assert_log_contains '.*--build-arg B12X_CACHEBUST=[0-9]+'
     assert_log_not_contains 'Dockerfile\.mxfp4'
     assert_output_contains 'Rebuilding vLLM wheels \(--exp-b12x preset\)\.\.\.'
@@ -1235,13 +1239,17 @@ test_dockerfile_builds_and_verifies_b12x_source() {
             fail "Dockerfile B12X source build is missing: $expected"
         fi
     done
-    if grep -Fq 'b12x==' "$PROJECT_DIR/Dockerfile"; then
-        fail "Dockerfile installs B12X from a package index instead of source"
-    fi
     if grep -Eq "import sparkinfer|m\.version\('sparkinfer'\)" "$PROJECT_DIR/Dockerfile"; then
         fail "Dockerfile still verifies the retired sparkinfer package name"
     fi
     pass "Dockerfile builds B12X from source without replacing vLLM dependencies"
+}
+
+test_build_dependency_updates() {
+    if ! python3 "$PROJECT_DIR/tests/test_build_dependency_updates.py"; then
+        fail "FlashInfer provider and B12X PyPI regression tests failed"
+    fi
+    pass "FlashInfer providers and B12X releases build with the selected settings"
 }
 
 test_copied_vllm_git_index_is_refreshed_before_patch_apply() {
@@ -1476,6 +1484,7 @@ test_dockerfile_uses_configurable_torch_versions
 test_dockerfile_pins_cutlass_dsl_47_everywhere
 test_dockerfile_uses_profiled_named_wheel_contexts
 test_dockerfile_builds_and_verifies_b12x_source
+test_build_dependency_updates
 test_copied_vllm_git_index_is_refreshed_before_patch_apply
 test_dockerfile_applies_flashinfer_prs_without_merging_branch_history
 test_dockerfile_uses_prepared_python_for_flashinfer_builds

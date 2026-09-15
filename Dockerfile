@@ -11,6 +11,7 @@ ARG CUTLASS_DSL_VERSION=4.7.0
 ARG B12X_REPO=""
 ARG B12X_REF=""
 ARG B12X_CACHEBUST=""
+ARG B12X_FROM_PYPI=0
 
 # Empty fallback for ordinary remote-source builds. A caller may override this
 # stage with --build-context vllm_source=/path/to/checkout.
@@ -120,6 +121,8 @@ FROM base AS flashinfer-builder
 
 ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
 ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
+# The provider shim accepts the same space-separated dotted architectures.
+ENV FLASHINFER_JIT_CACHE_PROVIDER_ARCHS=${FLASHINFER_CUDA_ARCH_LIST}
 WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REF=main
 ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
@@ -230,6 +233,7 @@ RUN set -eux; \
 
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
+COPY docker/build_flashinfer_jit_providers.sh /tmp/build_flashinfer_jit_providers.sh
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=cubins-cache,target=/workspace/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins \
@@ -241,7 +245,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     # flashinfer-cubin
     cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # flashinfer-jit-cache
-    cd ../flashinfer-jit-cache && \
+    cd .. && bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
+    cd flashinfer-jit-cache && \
     uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
     # dump git ref and target architecture in the wheels dir
     cd .. && \
@@ -697,6 +702,7 @@ ARG CUTLASS_DSL_VERSION
 ARG B12X_REPO
 ARG B12X_REF
 ARG B12X_CACHEBUST
+ARG B12X_FROM_PYPI
 
 # Transferring build settings from build image because of ptxas/jit compilation during vLLM startup
 # Build parallemism
@@ -794,6 +800,8 @@ ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
 # Enable vLLM's WSL2 pinned-memory path; override with -e VLLM_WSL2_ENABLE_PIN_MEMORY=0.
 ENV VLLM_WSL2_ENABLE_PIN_MEMORY=1
+# TODO: Make the B12X autotuning default architecture dependent.
+ENV B12X_AUTOTUNE=0
 
 
 # Final extra deps
@@ -812,9 +820,10 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         --override /tmp/torch-override.txt
 
 # Upstream vLLM and the local-inference-lab fork consume the external B12X
-# kernel package at runtime. Build B12X from its source repository but
-# install it without dependencies: vLLM already provides the runtime packages
-# and this image deliberately advances nvidia-cutlass-dsl to 4.7.0 for both
+# kernel package at runtime. Regular builds use the latest PyPI release;
+# experimental fork builds use source. Install without dependencies: vLLM
+# already provides the runtime packages, and this image deliberately advances
+# nvidia-cutlass-dsl to 4.7.0 for both
 # regular and B12X builds. B12X kernels remain JIT-compiled on first use;
 # building its Python wheel here does not compile the CUDA kernels.
 COPY docker/pin_cutlass_dsl.py /tmp/pin_cutlass_dsl.py
@@ -842,8 +851,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
         printf '%s\n' "$B12X_COMMIT" > /workspace/b12x-source-commit && \
         python3 -c "import importlib.metadata as m, sys; import b12x; print('Verified B12X', m.version('b12x'), 'from source commit', sys.argv[1], 'with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))" "$B12X_COMMIT" && \
         rm -rf /tmp/b12x-source; \
+    elif [ "$B12X_FROM_PYPI" = "1" ]; then \
+        echo "Refreshing B12X from PyPI (cache key: $B12X_CACHEBUST)" && \
+        uv pip install --upgrade --refresh-package b12x --no-deps --index-url https://pypi.org/simple b12x && \
+        python3 -c "import importlib.metadata as m; import b12x; print('Verified B12X', m.version('b12x'), 'from PyPI with CUTLASS DSL', m.version('nvidia-cutlass-dsl'))"; \
     else \
-        echo "B12X source build not requested; skipping."; \
+        echo "B12X installation not requested; skipping."; \
     fi
 
 # Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
