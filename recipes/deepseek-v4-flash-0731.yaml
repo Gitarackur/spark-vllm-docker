@@ -13,7 +13,7 @@ build_args:
 
 cluster_only: true
 
-mods:
+mods: []
 #  - mods/instanttensor-hybrid-draft-loader
 #   - mods/drop-caches
 
