@@ -799,7 +799,7 @@ ENV PATH=$VLLM_BASE_DIR:$PATH
 # Enable vLLM's WSL2 pinned-memory path; override with -e VLLM_WSL2_ENABLE_PIN_MEMORY=0.
 ENV VLLM_WSL2_ENABLE_PIN_MEMORY=1
 # TODO: Make the B12X autotuning default architecture dependent.
-ENV B12X_AUTOTUNE=0
+# ENV B12X_AUTOTUNE=0
 
 
 # Final extra deps
