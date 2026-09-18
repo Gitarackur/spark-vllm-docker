@@ -641,6 +641,11 @@ RUN python3 /tmp/vllm-patches/patch_vllm_routed_experts_weight_shape.py .
 # reservations behind just before vLLM sizes and allocates KV cache blocks.
 RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
+# TEMPORARY PATCH: local-inference-lab/vllm 3d5f2b04 exports temporary MoE
+# tuning tensors as PreparedCall.owners, which b12x retains in serving plans.
+# Keep the trial lifetime in call closures so KV profiling can reclaim them.
+RUN python3 /tmp/vllm-patches/patch_vllm_b12x_moe_tuning_memory.py .
+
 # WSL guest RAM does not describe CUDA's allocation budget on UMA devices.
 # Keep the fix in exported wheels as well as the runner below.
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py .

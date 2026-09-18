@@ -1387,8 +1387,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 14 ]; then
-        fail "Expected 14 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 15 ]; then
+        fail "Expected 15 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1426,6 +1426,13 @@ test_instanttensor_vllm_memory_patch() {
         fail "InstantTensor memory accounting regression tests failed"
     fi
     pass "InstantTensor uses vLLM memory accounting and preserves budget checks"
+}
+
+test_b12x_moe_tuning_memory_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_b12x_moe_tuning_memory_patch.py"; then
+        fail "B12X MoE trial-buffer lifetime regression tests failed"
+    fi
+    pass "B12X MoE releases trial buffers before KV cache profiling"
 }
 
 test_default_uses_prebuilt
@@ -1501,5 +1508,6 @@ test_dockerfile_externalizes_vllm_source_patches
 test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch
+test_b12x_moe_tuning_memory_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."
