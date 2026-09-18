@@ -2389,6 +2389,10 @@ the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
 (`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
 ranks, and buffer-size checks still apply.
 
+These runners also default to `INSTANTTENSOR_IO_DEPTH=16` to reduce GPU and
+pinned host staging-buffer usage. Override it through a recipe's `env` settings
+or `-e INSTANTTENSOR_IO_DEPTH=<depth>` with `launch-cluster.sh` or `docker run`.
+
 ## 9\. Benchmarking
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.

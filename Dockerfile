@@ -798,6 +798,9 @@ ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
 # Enable vLLM's WSL2 pinned-memory path; override with -e VLLM_WSL2_ENABLE_PIN_MEMORY=0.
 ENV VLLM_WSL2_ENABLE_PIN_MEMORY=1
+# Limit InstantTensor's in-flight I/O to reduce GPU and pinned host buffer usage.
+# Override per launch with -e INSTANTTENSOR_IO_DEPTH=<depth>.
+ENV INSTANTTENSOR_IO_DEPTH=16
 # TODO: Make the B12X autotuning default architecture dependent.
 # ENV B12X_AUTOTUNE=0
 
