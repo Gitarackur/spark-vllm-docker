@@ -2382,6 +2382,13 @@ To use it, include `--load-format fastsafetensors` when running vLLM:
 
 InstantTensor is available with `--load-format instanttensor`. Several large-model recipes use it to reduce load-time memory pressure.
 
+Regular and B12X runner builds, including regular `--use-wheels` builds, patch
+InstantTensor to use vLLM's available-memory accounting for its loading-buffer
+budget. This includes reclaimable OS memory on native DGX Spark and preserves
+the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
+(`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
+ranks, and buffer-size checks still apply.
+
 ## 9\. Benchmarking
 
 I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new benchmarking tool that delivers results in the same format as llama-bench from llama.cpp suite.

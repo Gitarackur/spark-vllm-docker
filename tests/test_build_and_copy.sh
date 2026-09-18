@@ -1421,6 +1421,13 @@ test_torch_schema_enumeration_patch() {
     pass "Torch schema enumeration preserves defaults and patches the installed runner"
 }
 
+test_instanttensor_vllm_memory_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_instanttensor_vllm_memory_patch.py"; then
+        fail "InstantTensor memory accounting regression tests failed"
+    fi
+    pass "InstantTensor uses vLLM memory accounting and preserves budget checks"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -1493,5 +1500,6 @@ test_dockerfile_fetches_vllm_prs_from_upstream
 test_dockerfile_externalizes_vllm_source_patches
 test_swa_block_size_patch
 test_torch_schema_enumeration_patch
+test_instanttensor_vllm_memory_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."
