@@ -33,7 +33,7 @@ defaults:
 env:
   DG_JIT_USE_NVRTC: "0"
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
 
 # The vLLM serve command template
 command: |

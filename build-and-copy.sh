@@ -34,7 +34,7 @@ VLLM_SOURCE_STAGING_DIR=""
 VLLM_SOURCE_CONTEXT=""
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
-EXP_B12X_VLLM_REF="dev/infernal-invocation"
+EXP_B12X_VLLM_REF="dev/karmic-kraken"
 B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
 B12X_PACKAGE_REF="master"
 EXP_B12X_TORCH_VERSION="2.13.0"
@@ -43,6 +43,7 @@ EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
 B12X_REPO=""
 B12X_REF=""
 B12X_CACHEBUST=""
+B12X_FROM_PYPI=0
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
@@ -118,6 +119,7 @@ generate_build_metadata() {
     local b12x_repo="${13}"
     local b12x_ref="${14}"
     local cutlass_dsl_version="${15}"
+    local b12x_from_pypi="${16:-0}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -139,6 +141,7 @@ build_args:
   cutlass_dsl_version: "${cutlass_dsl_version}"
   b12x_repo: "${b12x_repo}"
   b12x_ref: "${b12x_ref}"
+  b12x_from_pypi: ${b12x_from_pypi}
   transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
@@ -621,7 +624,7 @@ usage() {
     echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
     echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
-    echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-vllm-pr <pr-or-url>   : Apply a vLLM PR number or full GitHub PR URL to source. Can be specified multiple times."
     echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
@@ -632,6 +635,22 @@ usage() {
     echo "  --setup                       : Force autodiscovery and save configuration (even if .env exists)"
     echo "  -h, --help                    : Show this help message"
     exit 1
+}
+
+normalize_vllm_pr_reference() {
+    local value="$1"
+
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if [[ "$value" =~ ^https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/pull/[1-9][0-9]*/?$ ]]; then
+        printf '%s\n' "${value%/}"
+        return 0
+    fi
+
+    return 1
 }
 
 # Parse all arguments
@@ -717,15 +736,20 @@ while [[ "$#" -gt 0 ]]; do
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
         --exp-b12x|--experimental-b12x) EXP_B12X=true ;;
         --apply-vllm-pr)
-            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+            VLLM_PR_REFERENCE=""
+            if [ -n "${2:-}" ]; then
+                VLLM_PR_REFERENCE="$(normalize_vllm_pr_reference "$2")" \
+                    || VLLM_PR_REFERENCE=""
+            fi
+            if [ -n "$VLLM_PR_REFERENCE" ]; then
                if [ -n "$VLLM_PRS" ]; then
-                   VLLM_PRS="$VLLM_PRS $2"
+                   VLLM_PRS="$VLLM_PRS $VLLM_PR_REFERENCE"
                else
-                   VLLM_PRS="$2"
+                   VLLM_PRS="$VLLM_PR_REFERENCE"
                fi
                shift
             else
-               echo "Error: --apply-vllm-pr requires a PR number."
+               echo "Error: --apply-vllm-pr requires a positive integer PR number or full https://github.com/OWNER/REPO/pull/NUMBER URL."
                exit 1
             fi
             ;;
@@ -836,15 +860,20 @@ NORMALIZED_DEFAULT_VLLM_REPO="${DEFAULT_VLLM_REPO%/}"
 NORMALIZED_DEFAULT_VLLM_REPO="${NORMALIZED_DEFAULT_VLLM_REPO%.git}"
 if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
    [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
-    B12X_REPO="$B12X_PACKAGE_REPO"
-    B12X_REF="$B12X_PACKAGE_REF"
     B12X_CACHEBUST="$(date +%s)"
     TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
     if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
         echo "Error: ${NORMALIZED_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
         exit 1
     fi
-    echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
+        B12X_REPO="$B12X_PACKAGE_REPO"
+        B12X_REF="$B12X_PACKAGE_REF"
+        echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    else
+        B12X_FROM_PYPI=1
+        echo "Installing latest B12X from PyPI for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
+    fi
 fi
 
 # Source autodiscover.sh to load .env file
@@ -1314,7 +1343,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION"
+            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION" "$B12X_FROM_PYPI"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
@@ -1325,6 +1354,10 @@ if [ "$NO_BUILD" = false ]; then
         if [ -n "$B12X_REPO" ]; then
             RUNNER_CMD+=("--build-arg" "B12X_REPO=$B12X_REPO")
             RUNNER_CMD+=("--build-arg" "B12X_REF=$B12X_REF")
+        elif [ "$B12X_FROM_PYPI" = "1" ]; then
+            RUNNER_CMD+=("--build-arg" "B12X_FROM_PYPI=$B12X_FROM_PYPI")
+        fi
+        if [ -n "$B12X_CACHEBUST" ]; then
             RUNNER_CMD+=("--build-arg" "B12X_CACHEBUST=$B12X_CACHEBUST")
         fi
 

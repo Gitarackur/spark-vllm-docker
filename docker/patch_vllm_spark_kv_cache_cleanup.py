@@ -55,6 +55,17 @@ def find_line(pattern: str) -> tuple[int, re.Match[str]]:
     raise SystemExit(f"Could not find expected vLLM pattern: {pattern}")
 
 
+def find_first_line(patterns: tuple[str, ...]) -> tuple[int, re.Match[str]]:
+    for pattern in patterns:
+        regex = re.compile(pattern)
+        for index, line in enumerate(lines):
+            match = regex.match(line)
+            if match:
+                return index, match
+    expected = "\n".join(f"  - {pattern}" for pattern in patterns)
+    raise SystemExit(f"Could not find any expected vLLM pattern:\n{expected}")
+
+
 def insert_after_docstring(func_index: int, func_indent: str, block: list[str]) -> None:
     insert_at = func_index + 1
     if insert_at < len(lines):
@@ -80,11 +91,17 @@ def insert_after_docstring(func_index: int, func_indent: str, block: list[str]) 
 
 
 if not profile_cleanup_present:
-    snapshot_line = (
+    # The B12X fork takes a final snapshot after CUDA-graph profiling so it can
+    # account for late persistent allocations. Clean up before that snapshot;
+    # otherwise the memory it is meant to release remains charged to the KV
+    # cache budget. Upstream vLLM currently reads after_profile directly.
+    profile_cleanup_anchors = (
+        r"^(?P<indent>[ \t]+)final_profile_snapshot = "
+        r"MemorySnapshot\(device=self\.device\)\n$",
         r"^(?P<indent>[ \t]+)free_gpu_memory = "
-        r"profile_result\.after_profile\.free_memory\n$"
+        r"profile_result\.after_profile\.free_memory\n$",
     )
-    index, match = find_line(snapshot_line)
+    index, match = find_first_line(profile_cleanup_anchors)
     indent = match.group("indent")
     lines[index:index] = [
         f"{indent}# spark-vllm-docker: post-profile cleanup before KV sizing\n",
@@ -103,11 +120,24 @@ if not profile_cleanup_present:
         f"{indent}    profile_result.non_torch_increase = (\n",
         f"{indent}        diff_from_create.non_torch_memory\n",
         f"{indent}    )\n",
-        f"{indent}    profile_result.non_kv_cache_memory = (\n",
-        f"{indent}        profile_result.non_torch_increase\n",
-        f"{indent}        + profile_result.torch_peak_increase\n",
-        f"{indent}        + profile_result.weights_memory\n",
-        f"{indent}    )\n",
+        f'{indent}    if hasattr(profile_result, "transient_peak_headroom"):\n',
+        f"{indent}        # Newer vLLM measures all persistent allocations from\n",
+        f"{indent}        # device free memory, including Torch allocations.\n",
+        f"{indent}        profile_result.total_consumed = (\n",
+        f"{indent}            profile_result.before_create.free_memory\n",
+        f"{indent}            - profile_result.after_profile.free_memory\n",
+        f"{indent}        )\n",
+        f"{indent}        profile_result.non_kv_cache_memory = (\n",
+        f"{indent}            profile_result.total_consumed\n",
+        f"{indent}            + profile_result.transient_peak_headroom\n",
+        f"{indent}        )\n",
+        f"{indent}    else:\n",
+        f"{indent}        # Compatibility with older profiling results.\n",
+        f"{indent}        profile_result.non_kv_cache_memory = (\n",
+        f"{indent}            profile_result.non_torch_increase\n",
+        f"{indent}            + profile_result.torch_peak_increase\n",
+        f"{indent}            + profile_result.weights_memory\n",
+        f"{indent}        )\n",
         f"{indent}    cleanup_freed = (\n",
         f"{indent}        profile_result.after_profile.free_memory - before_cleanup\n",
         f"{indent}    )\n",

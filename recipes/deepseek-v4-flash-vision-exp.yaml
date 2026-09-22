@@ -1,11 +1,11 @@
-# Recipe: DeepSeek V4 Flash 0731
-# DeepSeek V4 Flash using the B12X-optimized serving stack on an SM121 cluster
+# Recipe: DeepSeek V4 Flash Vision Exp
+# DeepSeek V4 Flash with Vision support using the B12X-optimized serving stack on an SM121 cluster
 
 recipe_version: "1"
-name: DeepSeek-V4-Flash-0731
-description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-0731 on a dual Sparks using B12X docker
+name: DeepSeek-V4-Flash-Vision-Exp
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-Vision-Exp on a dual Sparks using B12X docker
 
-model: deepseek-ai/DeepSeek-V4-Flash-0731
+model: deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
 container: vllm-node-b12x
 
 build_args:
@@ -27,7 +27,7 @@ defaults:
   max_num_seqs: 8
   max_num_batched_tokens: 8192
   max_cudagraph_capture_size: 48
-  num_speculative_tokens: 5
+  num_speculative_tokens: 6
 
 env:
   CUTE_DSL_ARCH: "sm_121a"
@@ -47,7 +47,7 @@ env:
   B12X_MOE_FORCE_A8: "1"
 
 command: |
-  vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 \
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
       --host {host} \
       --port {port} \
       --trust-remote-code \

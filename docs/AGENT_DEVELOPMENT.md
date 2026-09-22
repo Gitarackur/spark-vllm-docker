@@ -163,8 +163,15 @@ real deployment for them.
   expansions, and use arrays for commands rather than assembling shell strings.
 - Python supports 3.10+. Prefer `pathlib.Path`, argument lists for subprocesses,
   and existing helpers in `run-recipe.py`.
-- Keep mods targeted and repeatable. `mods/<name>/run.sh` should apply cleanly or
-  detect that it is already applied.
+- Apply built-in vLLM fixes to source before building the wheel. Wheels are
+  released alongside the Docker image and already contain those fixes; do not
+  add runner-stage patching or compatibility paths for unpatched vLLM wheels.
+- Keep mods targeted and repeatable. Mods are always applied at runtime to a
+  freshly created vLLM container; there is no supported workflow where a new
+  mod version is applied over a container patched by an older version. Do not
+  add migration, legacy-patch detection, or reversal logic for previously
+  patched containers. `mods/<name>/run.sh` should still apply cleanly or detect
+  repeat application during the same fresh-container launch.
 - Preserve executable bits on shell and Python entry points.
 - Keep changes scoped. Do not embed credentials, machine-specific IPs, cache
   paths, `.env` values, or generated launch output in tracked files.
