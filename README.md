@@ -2155,7 +2155,7 @@ network topology prevents autodiscovery from working.
 | :--- | :--- |
 | `CLUSTER_NODES` | Comma-separated node IPs used for Ray/vLLM cluster (head node first). |
 | `COPY_HOSTS` | Comma-separated node IPs used for image and model distribution. In mesh mode these are the IPs on the direct IB-attached interfaces, which may differ from `CLUSTER_NODES`. |
-| `LOCAL_IP` | IP address of the local node. |
+| `LOCAL_IP` | IP address of the local cluster node. Solo mode uses `127.0.0.1`. |
 | `ETH_IF` | Ethernet interface for cluster coordination (e.g. `enp1s0f1np1` or `enP7s7`). |
 | `IB_IF` | Comma-separated RoCE/IB device names (e.g. `rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1`). |
 | `CONTAINER_*` | Any variable prefixed with `CONTAINER_` (except `CONTAINER_NAME`) is passed as `-e VAR=VALUE` to the container. Example: `CONTAINER_NCCL_DEBUG=INFO` → `-e NCCL_DEBUG=INFO`. |

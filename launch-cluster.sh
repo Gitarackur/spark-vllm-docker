@@ -110,7 +110,7 @@ usage() {
     echo "  IB_IF               InfiniBand interface name"
     echo "  MASTER_PORT         Port for cluster coordination (default: 29501)"
     echo "  CONTAINER_NAME      Container name (default: vllm_node)"
-    echo "  LOCAL_IP            Local IP address (for solo mode or override auto-detection)"
+    echo "  LOCAL_IP            Cluster local IP override (solo mode uses loopback)"
     echo "  CONTAINER_*         Any variable starting with CONTAINER_ (except CONTAINER_NAME)"
     echo "                      becomes -e flag. Example: CONTAINER_NCCL_DEBUG=INFO -> -e NCCL_DEBUG=INFO"
     echo ""
@@ -573,11 +573,8 @@ if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
 fi
 
 if [[ "$SOLO_MODE" == "true" ]]; then
-    # Solo mode: skip node detection, just get local IP
-    # Use LOCAL_IP from .env if set, otherwise default to 127.0.0.1
-    if [[ -z "$LOCAL_IP" ]]; then
-        LOCAL_IP="127.0.0.1"
-    fi
+    # Solo mode: skip network detection and ignore any saved cluster IP.
+    LOCAL_IP="127.0.0.1"
     NODES_ARG="$LOCAL_IP"
     PEER_NODES=()
     echo "Solo mode enabled. Skipping node detection."
@@ -621,6 +618,8 @@ fi
 if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
     echo "Only local node detected/configured. Activating solo mode (no Ray cluster)."
     SOLO_MODE="true"
+    LOCAL_IP="127.0.0.1"
+    HEAD_IP="$LOCAL_IP"
 fi
 
 if [[ "$SOLO_MODE" == "true" ]]; then
@@ -1319,7 +1318,7 @@ get_env_flags() {
         # docker run appends user environment flags after these defaults.
         local solo_if="${ETH_IF_OVERRIDE:-lo}"
         printf -- '-e %s ' \
-            "VLLM_HOST_IP=127.0.0.1" \
+            "VLLM_HOST_IP=$node_ip" \
             "NCCL_SOCKET_IFNAME=$solo_if" \
             "NCCL_IB_DISABLE=1" \
             "GLOO_SOCKET_IFNAME=$solo_if" \
