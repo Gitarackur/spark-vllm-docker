@@ -1747,6 +1747,13 @@ including B12X: alternate targets rebuild FlashInfer when no matching
 architecture marker is present, and the cached wheel records its architecture
 so a later build cannot silently reuse a wheel for a different target.
 
+For FlashInfer JIT-cache wheels that declare architecture-specific provider
+dependencies, local builds validate the required provider wheels and versions
+before compiling vLLM or building the runner. Incomplete exports are rejected
+before replacing the cached wheel set. Missing or mismatched providers produce
+an error suggesting `--rebuild-flashinfer`. Older monolithic JIT-cache wheels
+remain supported without provider wheels.
+
 Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository or local source checkout forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories, local source checkouts, and refs.
 
 Wheel profiles are selected automatically:
