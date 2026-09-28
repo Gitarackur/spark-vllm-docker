@@ -436,6 +436,13 @@ if match:
         fi
 
         local NEED_DOWNLOAD=false
+        # An incomplete cache must not win the commit/timestamp shortcuts. In
+        # particular, a repaired release may add providers without changing the
+        # base wheel filenames or the upstream commit.
+        if [ "$PREFIX" = "flashinfer" ] && \
+           ! validate_flashinfer_wheel_set "$WHEELS_DIR" >/dev/null 2>&1; then
+            NEED_DOWNLOAD=true
+        fi
         local RELEASE_ASSETS_PRESENT=true
         local URL NAME
         while IFS=' ' read -r URL NAME; do
@@ -447,7 +454,8 @@ if match:
         done <<< "$RELEASE_ENTRIES"
 
         if [ "$RELEASE_ASSETS_PRESENT" = false ]; then
-            if local_wheels_are_newer_than_release "$WHEELS_DIR" "$PREFIX" "$RELEASE_ENTRIES"; then
+            if [ "$NEED_DOWNLOAD" = false ] && \
+               local_wheels_are_newer_than_release "$WHEELS_DIR" "$PREFIX" "$RELEASE_ENTRIES"; then
                 echo "Local $PREFIX wheels are newer than release '$TAG' — skipping download."
                 return 0
             fi
@@ -497,28 +505,42 @@ if match:
 
     local URL NAME TMP_WHL
     local DOWNLOADED=()
+    local DOWNLOAD_FAILED=false
     while IFS=' ' read -r URL NAME; do
         [ -z "$URL" ] && continue
         echo "Downloading $NAME..."
         TMP_WHL=$(mktemp "$WHEELS_DIR/${NAME}.XXXXXX")
-        if curl -L --progress-bar --connect-timeout 30 "$URL" -o "$TMP_WHL"; then
+        if curl -fL --progress-bar --connect-timeout 30 "$URL" -o "$TMP_WHL"; then
             mv "$TMP_WHL" "$WHEELS_DIR/$NAME"
             DOWNLOADED+=("$WHEELS_DIR/$NAME")
         else
             rm -f "$TMP_WHL"
-            echo "Failed to download $NAME — removing other downloaded files."
-            for f in "${DOWNLOADED[@]}"; do rm -f "$f"; done
-            if compgen -G "$DL_BACKUP/${PREFIX}*.whl" > /dev/null 2>&1; then
-                echo "Restoring previous $PREFIX wheels..."
-                mv "$DL_BACKUP/${PREFIX}"*.whl "$WHEELS_DIR/"
-            fi
-            if compgen -G "$DL_BACKUP/.${PREFIX}*" > /dev/null 2>&1; then
-                mv "$DL_BACKUP/.${PREFIX}"* "$WHEELS_DIR/"
-            fi
-            rm -rf "$DL_BACKUP"
-            return 1
+            echo "Failed to download $NAME."
+            DOWNLOAD_FAILED=true
+            break
         fi
     done <<< "$DOWNLOAD_ENTRIES"
+
+    # A successful transfer can still be an incomplete published wheel set.
+    # Keep the previous cache and provenance until provider validation passes.
+    if [ "$DOWNLOAD_FAILED" = false ] && [ "$PREFIX" = "flashinfer" ] && \
+       ! validate_flashinfer_wheel_set "$WHEELS_DIR"; then
+        echo "Error: FlashInfer release '$TAG' contains an incomplete or invalid wheel set."
+        echo "       The release must include every provider required by its JIT-cache wheel."
+        DOWNLOAD_FAILED=true
+    fi
+    if [ "$DOWNLOAD_FAILED" = true ]; then
+        for f in "${DOWNLOADED[@]}"; do rm -f "$f"; done
+        if compgen -G "$DL_BACKUP/${PREFIX}*.whl" > /dev/null 2>&1; then
+            echo "Restoring previous $PREFIX wheels..."
+            mv "$DL_BACKUP/${PREFIX}"*.whl "$WHEELS_DIR/"
+        fi
+        if compgen -G "$DL_BACKUP/.${PREFIX}*" > /dev/null 2>&1; then
+            mv "$DL_BACKUP/.${PREFIX}"* "$WHEELS_DIR/"
+        fi
+        rm -rf "$DL_BACKUP"
+        return 1
+    fi
 
     rm -rf "$DL_BACKUP"
     if [ -n "$REMOTE_COMMIT" ]; then

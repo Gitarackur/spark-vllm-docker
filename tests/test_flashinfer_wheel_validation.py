@@ -4,6 +4,7 @@
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from zipfile import ZipFile
@@ -163,6 +164,27 @@ class FlashInferWheelValidationTests(unittest.TestCase):
     def test_unrecognized_provider_requirement_is_not_skipped(self):
         self.shim("flashinfer-jit-cache-sm121a>=0.7.0")
         self.check("Unsupported FlashInfer provider requirement")
+
+    def test_publication_listing_defaults_to_sm121a_and_excludes_unrelated_wheels(self):
+        self.shim("flashinfer-jit-cache-sm121a==0.7.0")
+        provider = self.write_wheel("flashinfer-jit-cache-sm121a")
+        self.write_wheel("flashinfer-jit-cache-sm120a")
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_DIR / "docker/validate_flashinfer_wheels.py"),
+             str(self.jit), "--list-provider-wheels"], capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [str(provider)])
+
+    def test_failed_publication_listing_emits_no_partial_list(self):
+        self.shim("flashinfer-jit-cache-sm121a==0.7.0", "flashinfer-jit-cache-sm120f==0.7.0")
+        self.write_wheel("flashinfer-jit-cache-sm121a")
+        result = subprocess.run(
+            [sys.executable, str(PROJECT_DIR / "docker/validate_flashinfer_wheels.py"),
+             str(self.jit), "--list-provider-wheels"], capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
 
 
 if __name__ == "__main__":

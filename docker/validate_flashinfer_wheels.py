@@ -5,6 +5,7 @@ Uses only the standard library so host-side validation needs no package installs
 Older monolithic wheels declare no provider dependencies and remain supported.
 """
 
+import argparse
 from email.parser import BytesParser
 from pathlib import Path
 import re
@@ -42,7 +43,7 @@ def provider_tag(architecture: str) -> str:
     return f"sm{normalized}"
 
 
-def validate_providers(jit_wheel: Path, architectures: str) -> None:
+def validate_providers(jit_wheel: Path, architectures: str) -> list[Path]:
     metadata = read_metadata(jit_wheel)
     if normalize_name(metadata["Name"]) != "flashinfer-jit-cache":
         raise ValueError(f"Expected flashinfer-jit-cache metadata in {jit_wheel.name}")
@@ -69,7 +70,7 @@ def validate_providers(jit_wheel: Path, architectures: str) -> None:
         requirements[name] = version
 
     if not requirements:
-        return
+        return []
 
     for architecture in architectures.split():
         name = f"flashinfer-jit-cache-{provider_tag(architecture)}"
@@ -81,6 +82,7 @@ def validate_providers(jit_wheel: Path, architectures: str) -> None:
 
     # Check every declared dependency, including additional architectures in a
     # multi-architecture shim: the installer requires all of them, not just one.
+    providers = []
     for name, version in requirements.items():
         pattern = f"{name.replace('-', '_')}-*.whl"
         wheels = sorted(jit_wheel.parent.glob(pattern))
@@ -104,21 +106,30 @@ def validate_providers(jit_wheel: Path, architectures: str) -> None:
                 f"FlashInfer provider {wheels[0].name} does not satisfy {name}=={version}; "
                 f"wheel metadata declares {provider['Name']}=={actual_version}"
             )
+        providers.append(wheels[0])
+    return providers
 
 
 def main() -> int:
-    jit_wheel = Path(sys.argv[1])
-    architectures = sys.argv[2]
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("jit_wheel", type=Path)
+    parser.add_argument("architectures", nargs="?", default="12.1a")
+    parser.add_argument("--list-provider-wheels", action="store_true",
+                        help="Print validated provider paths for release publication")
+    args = parser.parse_args()
     try:
-        validate_providers(jit_wheel, architectures)
+        providers = validate_providers(args.jit_wheel, args.architectures)
     except ValueError as exc:
         print(f"Error: {exc}.", file=sys.stderr)
         print(
             "       Re-run with --rebuild-flashinfer to regenerate a complete "
-            f"FlashInfer wheel set for GPU arch {architectures}.",
+            f"FlashInfer wheel set for GPU arch {args.architectures}.",
             file=sys.stderr,
         )
         return 1
+    if args.list_provider_wheels:
+        for provider in providers:
+            print(provider)
     return 0
 
 
