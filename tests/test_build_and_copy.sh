@@ -35,6 +35,21 @@ fail() {
     exit 1
 }
 
+write_wheel_metadata() {
+    python3 - "$@" <<'PY'
+import sys
+from zipfile import ZipFile
+
+path, name, version, *requirements = sys.argv[1:]
+metadata = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+metadata += "".join(f"Requires-Dist: {requirement}\n" for requirement in requirements)
+with ZipFile(path, "w") as archive:
+    archive.writestr(f"{name.replace('-', '_')}-{version}.dist-info/METADATA", metadata + "\n")
+PY
+}
+# The fake Docker exporter uses the same metadata fixtures as the local cache.
+export -f write_wheel_metadata
+
 setup_fixture() {
     TEST_INDEX=$((TEST_INDEX + 1))
     CASE_DIR="$TMP_BASE/case-$TEST_INDEX"
@@ -57,10 +72,11 @@ setup_fixture() {
         "$FIXTURE_DIR/.wheel-cache/vllm/custom"
     touch \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_cubin-test.whl" \
-        "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl" \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_python-test.whl" \
         "$FIXTURE_DIR/.wheel-cache/vllm/regular/vllm-test.whl" \
         "$FIXTURE_DIR/.wheel-cache/vllm/b12x/vllm-test.whl"
+    write_wheel_metadata "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl" \
+        flashinfer-jit-cache 0.7.0
     touch "$FIXTURE_DIR/test.env"
     : > "$TEST_LOG"
     : > "$OUTPUT_LOG"
@@ -95,7 +111,16 @@ if [ "${1:-}" = "build" ]; then
                 case "$target" in
                     flashinfer-export)
                         printf 'fake wheel\n' > "$dest/flashinfer_cubin-built.whl"
-                        printf 'fake wheel\n' > "$dest/flashinfer_jit_cache-built.whl"
+                        requirements=()
+                        if [ "${MOCK_FLASHINFER_SPLIT_EXPORT:-}" != "" ]; then
+                            requirements=('flashinfer-jit-cache-sm121a==0.7.0')
+                            if [ "$MOCK_FLASHINFER_SPLIT_EXPORT" = complete ]; then
+                                write_wheel_metadata "$dest/flashinfer_jit_cache_sm121a-0.7.0-py3-none-any.whl" \
+                                    flashinfer-jit-cache-sm121a 0.7.0
+                            fi
+                        fi
+                        write_wheel_metadata "$dest/flashinfer_jit_cache-built.whl" \
+                            flashinfer-jit-cache 0.7.0 "${requirements[@]}"
                         printf 'fake wheel\n' > "$dest/flashinfer_python-built.whl"
                         printf 'flashinfer-commit\n' > "$dest/.flashinfer-commit"
                         printf '%s\n' "$build_arch" > "$dest/.flashinfer-arch"
@@ -277,8 +302,9 @@ test_regular_build_reuses_matching_cached_flashinfer_arch() {
     setup_fixture
     touch \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_cubin-test.whl" \
-        "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_jit_cache-test.whl" \
         "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_python-test.whl"
+    write_wheel_metadata "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/flashinfer_jit_cache-test.whl" \
+        flashinfer-jit-cache 0.7.0
     printf '12.0f\n' > "$FIXTURE_DIR/.wheel-cache/flashinfer/custom/.flashinfer-arch"
     run_build --gpu-arch 12.0f || fail "regular matching cached-arch build failed"
     assert_log_not_contains '^docker build --target flashinfer-export '
@@ -331,6 +357,67 @@ test_use_wheels_uses_wheel_build() {
     assert_log_contains '^docker build -t vllm-node '
     assert_log_contains 'NCCL_NVCC_GENCODE=-gencode=arch=compute_121,code=sm_121'
     pass "--use-wheels builds only the runner from precompiled wheels"
+}
+
+test_missing_flashinfer_provider_stops_before_vllm_build() {
+    setup_fixture
+    write_wheel_metadata "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl" \
+        flashinfer-jit-cache 0.7.0 'flashinfer-jit-cache-sm121a==0.7.0'
+    if run_build --rebuild-vllm; then
+        fail "missing FlashInfer provider unexpectedly passed validation"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'provider wheel for arch sm121a .* is missing'
+    assert_output_contains 'Re-run with --rebuild-flashinfer.*GPU arch 12\.1a'
+    pass "missing cached FlashInfer provider stops before vLLM or runner builds"
+}
+
+test_complete_flashinfer_provider_cache_builds_runner() {
+    setup_fixture
+    write_wheel_metadata "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl" \
+        flashinfer-jit-cache 0.7.0 'flashinfer-jit-cache-sm121a==0.7.0'
+    write_wheel_metadata "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache_sm121a-0.7.0-py3-none-any.whl" \
+        flashinfer-jit-cache-sm121a 0.7.0
+    run_build --use-wheels || fail "complete provider cache was rejected"
+    assert_log_not_contains '^docker build --target '
+    assert_log_contains '^docker build -t vllm-node '
+    pass "complete FlashInfer provider cache builds the runner without recompiling"
+}
+
+test_incomplete_flashinfer_export_preserves_cache() {
+    setup_fixture
+    local cached_jit="$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-test.whl"
+    cp "$cached_jit" "$CASE_DIR/previous-jit.whl"
+    if MOCK_FLASHINFER_SPLIT_EXPORT=missing run_build --rebuild-flashinfer; then
+        fail "missing exported FlashInfer provider unexpectedly passed validation"
+    fi
+    assert_log_contains '^docker build --target flashinfer-export '
+    assert_log_not_contains '^docker build --target vllm-export '
+    assert_log_not_contains '^docker build -t '
+    assert_output_contains 'provider wheel for arch sm121a .* is missing'
+    assert_output_contains 'keeping the previous wheel profile unchanged'
+    cmp -s "$cached_jit" "$CASE_DIR/previous-jit.whl" || fail "old FlashInfer cache changed"
+    if [ -f "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache-built.whl" ]; then
+        fail "incomplete FlashInfer export replaced cached wheels"
+    fi
+    pass "incomplete FlashInfer export preserves the previous wheel cache"
+}
+
+test_complete_flashinfer_export_builds_runner() {
+    setup_fixture
+    MOCK_FLASHINFER_SPLIT_EXPORT=complete run_build --rebuild-flashinfer || fail "complete FlashInfer export failed"
+    assert_log_contains '^docker build --target flashinfer-export '
+    assert_log_contains '^docker build -t vllm-node '
+    [ -f "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/flashinfer_jit_cache_sm121a-0.7.0-py3-none-any.whl" ] || \
+        fail "complete FlashInfer provider was not promoted"
+    pass "complete FlashInfer export promotes providers and builds the runner"
+}
+
+test_flashinfer_provider_validation() {
+    if ! python3 "$PROJECT_DIR/tests/test_flashinfer_wheel_validation.py"; then
+        fail "FlashInfer wheel validation regression tests failed"
+    fi
+    pass "FlashInfer validators check provider metadata and retain monolithic support"
 }
 
 test_regular_build_includes_b12x_package() {
@@ -484,13 +571,7 @@ test_rebuild_vllm_applies_preset_prs_by_default() {
     run_build --rebuild-vllm || fail "--rebuild-vllm run failed"
     assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=main .*--build-arg VLLM_APPLY_PRESET_PRS=1'
     assert_output_contains 'Applying preset vLLM PRs from the Dockerfile by default\.'
-    local preset_prs
-    preset_prs="$(sed -n 's/^ARG VLLM_PRESET_PRS="\([^"]*\)"$/\1/p' "$FIXTURE_DIR/Dockerfile")"
-    case " $preset_prs " in
-        *" 54788 "*) ;;
-        *) fail "regular Dockerfile presets do not include vLLM PR #54788" ;;
-    esac
-    pass "ordinary main source rebuild applies vLLM PR #54788 by default"
+    pass "ordinary main source rebuild enables configured preset vLLM PRs by default"
 }
 
 test_apply_vllm_pr_skips_preset_prs_by_default() {
@@ -1387,8 +1468,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 15 ]; then
-        fail "Expected 15 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 16 ]; then
+        fail "Expected 16 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1435,6 +1516,20 @@ test_b12x_moe_tuning_memory_patch() {
     pass "B12X MoE releases trial buffers before KV cache profiling"
 }
 
+test_startup_heap_trim_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_startup_heap_trim_patch.py"; then
+        fail "Startup CPU heap trim regression tests failed"
+    fi
+    pass "Startup CPU heap trim preserves GC and skips unsupported allocators"
+}
+
+test_b12x_cache_integrity_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_b12x_cache_integrity_patch.py"; then
+        fail "B12X cache integrity regression tests failed"
+    fi
+    pass "B12X validates cached objects and durably publishes replacement kernels"
+}
+
 test_default_uses_prebuilt
 test_tf5_uses_prebuilt_tf5_tag
 test_custom_tag_uses_prebuilt_custom_tag
@@ -1447,6 +1542,11 @@ test_use_wheels_rejects_mismatched_flashinfer_arch
 test_use_wheels_rejects_mismatched_vllm_arch
 test_use_wheels_non_default_empty_cache_skips_downloads
 test_use_wheels_uses_wheel_build
+test_missing_flashinfer_provider_stops_before_vllm_build
+test_complete_flashinfer_provider_cache_builds_runner
+test_incomplete_flashinfer_export_preserves_cache
+test_complete_flashinfer_export_builds_runner
+test_flashinfer_provider_validation
 test_regular_build_includes_b12x_package
 test_use_wheels_never_falls_back_to_source
 test_use_wheels_never_builds_missing_vllm_implicitly
@@ -1509,5 +1609,7 @@ test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch
 test_b12x_moe_tuning_memory_patch
+test_startup_heap_trim_patch
+test_b12x_cache_integrity_patch
 
 echo "Passed $TESTS_PASSED build-and-copy tests."

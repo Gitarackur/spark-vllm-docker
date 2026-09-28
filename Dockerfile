@@ -382,13 +382,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# Optional upstream PR patches requested by the build wrapper. PR #54788 makes
-# Model Runner V2 honor an MTP/EAGLE draft's explicit MoE backend instead of
-# inheriting the quantized target's incompatible backend. Remove it once the fix
-# is present in the oldest vLLM ref used by regular builds. PR #47392 is carried
-# as a source-aware runtime patch below because its full diff now conflicts with
-# current upstream main.
-ARG VLLM_PRESET_PRS="54788"
+ARG VLLM_PRESET_PRS=""
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
@@ -534,6 +528,7 @@ COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
 # DFlash2 pages become mostly padding. Preserve the PR's supported-primary
 # path and restore the smallest-block fallback. Remove once supported refs
 # contain an equivalent upstream fix; unexpected source layouts fail closed.
+# Supports both the original selector and #53175's per-layer KV-spec API.
 RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
 
 # TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
@@ -641,6 +636,10 @@ RUN python3 /tmp/vllm-patches/patch_vllm_routed_experts_weight_shape.py .
 # reservations behind just before vLLM sizes and allocates KV cache blocks.
 RUN python3 /tmp/vllm-patches/patch_vllm_spark_kv_cache_cleanup.py .
 
+# Return unused glibc CPU heap pages after startup GC in API servers and
+# workers. Keep this in the source build so exported wheels include it too.
+RUN python3 /tmp/vllm-patches/patch_vllm_startup_heap_trim.py .
+
 # TEMPORARY PATCH: local-inference-lab/vllm 3d5f2b04 exports temporary MoE
 # tuning tensors as PreparedCall.owners, which b12x retains in serving plans.
 # Keep the trial lifetime in call closures so KV profiling can reclaim them.
@@ -650,11 +649,19 @@ RUN python3 /tmp/vllm-patches/patch_vllm_b12x_moe_tuning_memory.py .
 # Keep the fix in exported wheels as well as the runner below.
 RUN python3 /tmp/vllm-patches/patch_vllm_wsl_cuda_uma.py .
 
-# Prepare build requirements
+# Prepare build requirements. Upstream moved the Torch helper under tools/;
+# keep supporting older refs and forks with the root-level helper.
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 /tmp/vllm-patches/pin_cutlass_dsl.py \
         "$CUTLASS_DSL_VERSION" --expected-count 1 requirements/cuda.txt && \
-    python3 use_existing_torch.py && \
+    if [ -f tools/use_existing_torch.py ]; then \
+        python3 tools/use_existing_torch.py; \
+    elif [ -f use_existing_torch.py ]; then \
+        python3 use_existing_torch.py; \
+    else \
+        echo "ERROR: vLLM source is missing tools/use_existing_torch.py and use_existing_torch.py; cannot preserve the installed PyTorch." >&2; \
+        exit 1; \
+    fi && \
     sed -i "/flashinfer/d" requirements/cuda.txt && \
     sed -i '/^triton\b/d' requirements/test/cuda.txt && \
     sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
@@ -680,6 +687,13 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=vllm-rust-target,target=/workspace/vllm/vllm/target \
     VLLM_REQUIRE_RUST_FRONTEND=1 CARGO_BUILD_JOBS=${MAX_JOBS} \
     uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v
+
+# Keep this optional example with the selected source build for the runner.
+# The .vllm- prefix also ties it to wheel-download backup and replacement.
+RUN if [ -f examples/features/structured_diffusion/structured_server.py ]; then \
+        cp examples/features/structured_diffusion/structured_server.py \
+            /workspace/wheels/.vllm-structured-server.py; \
+    fi
 
 # Dump git refs in the wheels dir.
 RUN \
@@ -793,6 +807,13 @@ RUN --mount=type=bind,from=flashinfer_wheels,target=/workspace/flashinfer-wheels
     uv pip install /workspace/flashinfer-wheels/*.whl /workspace/vllm-wheels/*.whl \
         --override /tmp/wheel-override.txt
 
+# Older source refs and downloaded wheel sets may not include this example.
+RUN --mount=type=bind,from=vllm_wheels,target=/workspace/vllm-wheels \
+    if [ -f /workspace/vllm-wheels/.vllm-structured-server.py ]; then \
+        install -m 644 /workspace/vllm-wheels/.vllm-structured-server.py \
+            "$VLLM_BASE_DIR/structured_server.py"; \
+    fi
+
 # Setup environment for runtime
 ARG TORCH_CUDA_ARCH_LIST="12.1a"
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
@@ -851,6 +872,11 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     else \
         echo "B12X installation not requested; skipping."; \
     fi
+
+# Validate cached CuTe objects and recover from interrupted writes. Apply after
+# both source and PyPI B12X installs so every model/backend gets the same fix.
+COPY docker/patch_b12x_cache_integrity.py docker/b12x-cache-integrity.patch /tmp/b12x-patches/
+RUN python3 /tmp/b12x-patches/patch_b12x_cache_integrity.py --installed
 
 # Cached or downloaded wheels can predate the CUDA-on-WSL reporting fix.
 # This also accepts wheels that already contain the source-stage patch.

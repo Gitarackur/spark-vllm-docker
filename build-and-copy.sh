@@ -528,18 +528,28 @@ if match:
     return 0
 }
 
+validate_flashinfer_wheel_set() {
+    local wheels_dir="$1"
+    local cubin=("$wheels_dir"/flashinfer_cubin-*.whl)
+    local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
+    local python=("$wheels_dir"/flashinfer_python-*.whl)
+
+    if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
+       [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
+       [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
+        echo "Error: FlashInfer profile $wheels_dir does not contain exactly one complete wheel set."
+        return 1
+    fi
+    python3 ./docker/validate_flashinfer_wheels.py "${jit[0]}" "$GPU_ARCH_LIST"
+}
+
 validate_exported_wheel_set() {
     local component="$1"
     local wheels_dir="$2"
 
     if [ "$component" = "flashinfer" ]; then
-        local cubin=("$wheels_dir"/flashinfer_cubin-*.whl)
-        local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
-        local python=("$wheels_dir"/flashinfer_python-*.whl)
-        if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
-           [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
-           [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ] || \
-           [ ! -s "$wheels_dir/.flashinfer-commit" ] || \
+        validate_flashinfer_wheel_set "$wheels_dir" || return 1
+        if [ ! -s "$wheels_dir/.flashinfer-commit" ] || \
            [ ! -s "$wheels_dir/.flashinfer-arch" ]; then
             echo "Error: FlashInfer export did not produce one complete wheel set with provenance markers."
             return 1
@@ -559,17 +569,9 @@ validate_exported_wheel_set() {
 validate_runner_wheel_inputs() {
     local flashinfer_dir="$1"
     local vllm_dir="$2"
-    local cubin=("$flashinfer_dir"/flashinfer_cubin-*.whl)
-    local jit=("$flashinfer_dir"/flashinfer_jit_cache-*.whl)
-    local python=("$flashinfer_dir"/flashinfer_python-*.whl)
     local vllm=("$vllm_dir"/vllm-*.whl)
 
-    if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
-       [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
-       [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
-        echo "Error: FlashInfer profile $flashinfer_dir does not contain exactly one complete wheel set."
-        return 1
-    fi
+    validate_flashinfer_wheel_set "$flashinfer_dir" || return 1
     if [ "${#vllm[@]}" -ne 1 ] || [ ! -f "${vllm[0]}" ]; then
         echo "Error: vLLM profile $vllm_dir does not contain exactly one wheel."
         return 1
@@ -1066,7 +1068,8 @@ if [[ "$CLEANUP_MODE" == "true" ]]; then
         [ -d "$cache_dir" ] || continue
         rm -f "$cache_dir"/*.whl \
             "$cache_dir"/.*-commit \
-            "$cache_dir"/.*-arch
+            "$cache_dir"/.*-arch \
+            "$cache_dir"/.vllm-structured-server.py
         echo "Cleaned $cache_dir"
     done
     echo "Cleanup complete."
@@ -1209,6 +1212,12 @@ if [ "$NO_BUILD" = false ]; then
                 echo "FlashInfer build failed — keeping the previous wheel profile unchanged."
                 exit 1
             fi
+        fi
+
+        # Reject incomplete cached/downloaded FlashInfer sets before compiling
+        # vLLM. Exported sets are also checked before replacing the old cache.
+        if ! validate_flashinfer_wheel_set "$FLASHINFER_WHEELS_DIR"; then
+            exit 1
         fi
 
         # ----------------------------------------------------------
