@@ -187,7 +187,38 @@ SSH
 #!/bin/bash
 set -euo pipefail
 echo "curl $*" >> "$TEST_LOG"
-exit 22
+[ -n "${MOCK_WHEEL_RELEASE_DIR:-}" ] || exit 22
+url=""
+output=""
+headers=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) output="$2"; shift 2 ;;
+        -*I*) headers=true; shift ;;
+        https://*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+case "$url" in
+    */releases/expanded_assets/prebuilt-flashinfer-current)
+        for wheel in "$MOCK_WHEEL_RELEASE_DIR"/flashinfer*.whl; do
+            printf '<a href="/eugr/spark-vllm-docker/releases/download/prebuilt-flashinfer-current/%s">wheel</a>\n' "${wheel##*/}"
+        done
+        ;;
+    */releases/tag/prebuilt-flashinfer-current)
+        echo 'Prebuilt FlashInfer Wheels (0.7.0-deadbeef-d20260928)'
+        ;;
+    */releases/download/prebuilt-flashinfer-current/*)
+        if [ "$headers" = true ]; then
+            echo 'Last-Modified: Sat, 01 Jan 2000 00:00:00 GMT'
+        elif [ "${url##*/}" = "${MOCK_WHEEL_FAIL_ASSET:-}" ]; then
+            exit 22
+        else
+            cp "$MOCK_WHEEL_RELEASE_DIR/${url##*/}" "$output"
+        fi
+        ;;
+    *) exit 22 ;;
+esac
 CURL
 
     chmod +x "$FAKE_BIN_DIR/docker" "$FAKE_BIN_DIR/ssh" "$FAKE_BIN_DIR/curl"
@@ -418,6 +449,118 @@ test_flashinfer_provider_validation() {
         fail "FlashInfer wheel validation regression tests failed"
     fi
     pass "FlashInfer validators check provider metadata and retain monolithic support"
+}
+
+create_flashinfer_release() {
+    RELEASE_DIR="$CASE_DIR/release"
+    mkdir -p "$RELEASE_DIR"
+    write_wheel_metadata "$RELEASE_DIR/flashinfer_cubin-0.7.0-py3-none-any.whl" flashinfer-cubin 0.7.0
+    write_wheel_metadata "$RELEASE_DIR/flashinfer_python-0.7.0-py3-none-any.whl" flashinfer-python 0.7.0
+    local requirements=()
+    if [ "$1" != monolithic ]; then
+        requirements=('flashinfer-jit-cache-sm121a==0.7.0')
+    fi
+    write_wheel_metadata "$RELEASE_DIR/flashinfer_jit_cache-0.7.0-cp39-abi3-manylinux_2_28_aarch64.whl" \
+        flashinfer-jit-cache 0.7.0 "${requirements[@]}"
+    if [ "$1" = complete ]; then
+        write_wheel_metadata "$RELEASE_DIR/flashinfer_jit_cache_sm121a-0.7.0-cp39-abi3-manylinux_2_28_aarch64.whl" \
+            flashinfer-jit-cache-sm121a 0.7.0
+    fi
+}
+
+test_flashinfer_release_download_includes_device_provider() {
+    setup_fixture
+    create_flashinfer_release complete
+    rm "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/"*.whl
+    MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --exp-b12x --rebuild-vllm || fail "B12X build with published providers failed"
+    assert_log_contains '^curl -fL .*flashinfer_jit_cache_sm121a-0.7.0-'
+    assert_log_contains '^docker build --target vllm-export '
+    assert_log_contains '^docker build -t vllm-node-b12x '
+    assert_log_not_contains '^docker build --target flashinfer-export '
+    pass "default B12X source build downloads the sm121a provider alongside the shim"
+}
+
+test_monolithic_flashinfer_release_download_still_works() {
+    setup_fixture
+    create_flashinfer_release monolithic
+    MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --use-wheels --force-flashinfer-download || fail "monolithic release failed"
+    assert_log_contains '^docker build -t vllm-node '
+    assert_log_not_contains '^curl -fL .*flashinfer_jit_cache_sm'
+    pass "legacy monolithic FlashInfer release downloads need no device provider"
+}
+
+test_incomplete_flashinfer_download_preserves_cache() {
+    setup_fixture
+    create_flashinfer_release missing
+    local cache="$FIXTURE_DIR/.wheel-cache/flashinfer/regular"
+    printf 'previous-commit\n' > "$cache/.flashinfer-commit"
+    printf '12.1a\n' > "$cache/.flashinfer-arch"
+    cp -a "$cache" "$CASE_DIR/previous-cache"
+    MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --use-wheels --force-flashinfer-download || fail "valid old cache was not reused"
+    assert_output_contains "FlashInfer release 'prebuilt-flashinfer-current' contains an incomplete or invalid wheel set"
+    assert_output_contains 'Restoring previous flashinfer wheels'
+    diff -r "$cache" "$CASE_DIR/previous-cache" || fail "incomplete release changed cached wheels or provenance"
+    assert_log_contains '^docker build -t vllm-node '
+    pass "an incomplete published set restores the previous FlashInfer cache and markers"
+}
+
+test_incomplete_flashinfer_download_without_cache_fails() {
+    setup_fixture
+    create_flashinfer_release missing
+    rm "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/"*.whl
+    if MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --exp-b12x --rebuild-vllm; then
+        fail "incomplete published wheels unexpectedly allowed B12X compilation"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains "FlashInfer release 'prebuilt-flashinfer-current' contains an incomplete or invalid wheel set"
+    if compgen -G "$FIXTURE_DIR/.wheel-cache/flashinfer/regular/*.whl" >/dev/null; then
+        fail "incomplete downloaded wheels remained in the cache"
+    fi
+    pass "incomplete releases fail before compilation when no valid cache exists"
+}
+
+test_repaired_release_bypasses_incomplete_cache_shortcuts() {
+    local shortcut
+    for shortcut in newer matching-commit; do
+        setup_fixture
+        create_flashinfer_release complete
+        local cache="$FIXTURE_DIR/.wheel-cache/flashinfer/regular"
+        rm "$cache/"*.whl
+        cp "$RELEASE_DIR/"*.whl "$cache/"
+        printf 'deadbeef\n' > "$cache/.flashinfer-commit"
+        if [ "$shortcut" = newer ]; then
+            rm "$cache/"flashinfer_jit_cache_sm*.whl
+        else
+            printf 'broken wheel\n' > "$cache/flashinfer_jit_cache_sm121a-0.7.0-cp39-abi3-manylinux_2_28_aarch64.whl"
+        fi
+        MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --use-wheels || fail "$shortcut invalid cache skipped repaired release"
+        assert_log_contains '^curl -fL .*flashinfer_jit_cache_sm121a-0.7.0-'
+        assert_log_contains '^docker build -t vllm-node '
+    done
+    pass "repaired releases replace incomplete caches despite matching commits or newer timestamps"
+}
+
+test_valid_newer_flashinfer_cache_skips_download() {
+    setup_fixture
+    create_flashinfer_release complete
+    MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" run_build --use-wheels || fail "valid newer cache failed"
+    assert_output_contains 'Local flashinfer wheels are newer than release'
+    assert_log_not_contains '^curl -fL '
+    pass "valid newer locally built FlashInfer wheels still skip downloads"
+}
+
+test_failed_flashinfer_asset_download_restores_cache() {
+    setup_fixture
+    create_flashinfer_release complete
+    local cache="$FIXTURE_DIR/.wheel-cache/flashinfer/regular"
+    printf 'previous-commit\n' > "$cache/.flashinfer-commit"
+    cp -a "$cache" "$CASE_DIR/previous-cache"
+    MOCK_WHEEL_RELEASE_DIR="$RELEASE_DIR" MOCK_WHEEL_FAIL_ASSET=flashinfer_python-0.7.0-py3-none-any.whl \
+        run_build --use-wheels --force-flashinfer-download || fail "download failure lost the previous cache"
+    diff -r "$cache" "$CASE_DIR/previous-cache" || fail "download failure changed cached wheels or provenance"
+    assert_output_contains 'Failed to download flashinfer_python'
+    assert_output_contains 'Restoring previous flashinfer wheels'
+    pass "failed wheel transfers restore the complete previous cache"
 }
 
 test_regular_build_includes_b12x_package() {
@@ -1547,6 +1690,13 @@ test_complete_flashinfer_provider_cache_builds_runner
 test_incomplete_flashinfer_export_preserves_cache
 test_complete_flashinfer_export_builds_runner
 test_flashinfer_provider_validation
+test_flashinfer_release_download_includes_device_provider
+test_monolithic_flashinfer_release_download_still_works
+test_incomplete_flashinfer_download_preserves_cache
+test_incomplete_flashinfer_download_without_cache_fails
+test_repaired_release_bypasses_incomplete_cache_shortcuts
+test_valid_newer_flashinfer_cache_skips_download
+test_failed_flashinfer_asset_download_restores_cache
 test_regular_build_includes_b12x_package
 test_use_wheels_never_falls_back_to_source
 test_use_wheels_never_builds_missing_vllm_implicitly

@@ -1749,10 +1749,14 @@ so a later build cannot silently reuse a wheel for a different target.
 
 For FlashInfer JIT-cache wheels that declare architecture-specific provider
 dependencies, local builds validate the required provider wheels and versions
-before compiling vLLM or building the runner. Incomplete exports are rejected
-before replacing the cached wheel set. Missing or mismatched providers produce
-an error suggesting `--rebuild-flashinfer`. Older monolithic JIT-cache wheels
-remain supported without provider wheels.
+before compiling vLLM or building the runner. Downloads include the provider
+filenames with device designators, such as `flashinfer_jit_cache_sm121a` for the
+default `12.1a` target. Incomplete exports are rejected before replacing the
+cached wheel set; incomplete downloads restore the previous cache. A corrected
+release is downloaded even when an incomplete cache has newer timestamps or the
+same upstream commit. Missing or mismatched providers produce an error
+suggesting `--rebuild-flashinfer`. Older monolithic JIT-cache wheels remain
+supported without provider wheels.
 
 Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository or local source checkout forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories, local source checkouts, and refs.
 
