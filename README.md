@@ -305,6 +305,10 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-09-30
+
+`./hf-download.sh` will now try to check and automatically repair cache permissions before downloading or distributing the model across the nodes.
+
 ### 2026-09-23
 
 #### EarlyOOM in 3rd-party containers
