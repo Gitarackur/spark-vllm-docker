@@ -1,8 +1,6 @@
 #!/bin/bash
 set -e
 
-HUB_PATH="${HF_HOME:-$HOME/.cache/huggingface}/hub"
-
 # Default values
 COPY_HOSTS=()
 SSH_USER="$USER"
@@ -20,7 +18,118 @@ usage() {
     echo "  -u, --user <user>           : Username for ssh commands (default: \$USER)"
     echo "  --config <file>             : Path to .env configuration file (default: .env in script directory)"
     echo "  -h, --help                  : Show this help message"
+    echo "Cache ownership is repaired using an existing vllm-node or vllm-node-b12x image, then sudo if needed."
+    echo "Sudo may prompt on each node before downloads or copies."
     exit 1
+}
+
+resolve_cache_path() {
+    # Match huggingface_hub's expansion without evaluating shell code from paths.
+    python3 - "$1" <<'PY'
+import os
+import sys
+
+def expand(path):
+    return os.path.expandvars(os.path.expanduser(path))
+
+cache_home = expand(os.environ.get(
+    "HF_HOME", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface")
+))
+path = cache_home if sys.argv[1] == "home" else expand(os.environ.get(
+    "HF_HUB_CACHE", os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(cache_home, "hub"))
+))
+if not path:
+    sys.exit("Error: Hugging Face cache paths must not be empty.")
+print(os.path.abspath(path))
+PY
+}
+
+repair_cache_ownership() {
+    local cache_dir checked_dir mismatch owner owner_uid image mount_source docker_repaired
+    local checked_dirs=() sudo_args=()
+    # Repair this host's files even if the caller has selected a remote Docker context.
+    local docker_cmd=(docker --host unix:///var/run/docker.sock)
+    owner=$(id -un) || return 1
+    owner_uid=$(id -u) || return 1
+    # A noninteractive run may use passwordless sudo, but must never wait for input.
+    [[ -t 0 ]] || sudo_args=(-n)
+
+    for cache_dir in "$@"; do
+        cache_dir=$(realpath -m -- "$cache_dir") || return 1
+        # Never recursively change a whole home directory or one of its parents.
+        if [[ "$cache_dir" == / || "$HOME/" == "$cache_dir/"* ]]; then
+            echo "Error: Refusing ownership repair for unsafe cache path: $cache_dir" >&2
+            return 1
+        fi
+        # The Hub cache normally lives inside HF_HOME; avoid scanning it twice.
+        for checked_dir in "${checked_dirs[@]}"; do
+            if [[ "$cache_dir/" == "$checked_dir/"* ]]; then
+                continue 2
+            fi
+        done
+        [[ -e "$cache_dir" ]] || continue
+
+        if mismatch=$(find "$cache_dir" ! -uid "$owner_uid" -print -quit); then
+            if [[ -z "$mismatch" ]]; then
+                checked_dirs+=("$cache_dir")
+                continue
+            fi
+        fi
+
+        echo "Repairing Hugging Face cache ownership for $owner: $cache_dir" >&2
+        docker_repaired=false
+        if command -v docker >/dev/null 2>&1; then
+            # Docker's --mount value is CSV; quote the source field for commas/quotes.
+            mount_source=${cache_dir//\"/\"\"}
+            for image in vllm-node vllm-node-b12x; do
+                "${docker_cmd[@]}" image inspect "$image" >/dev/null 2>&1 || continue
+                echo "Trying cache ownership repair with Docker image $image..." >&2
+                if "${docker_cmd[@]}" run --rm --pull=never --network none --user 0 \
+                        --mount "type=bind,\"src=$mount_source\",dst=/hf-cache" \
+                        --entrypoint chown "$image" -R -h -- "$owner_uid" /hf-cache \
+                        && mismatch=$(find "$cache_dir" ! -uid "$owner_uid" -print -quit) \
+                        && [[ -z "$mismatch" ]]; then
+                    docker_repaired=true
+                    break
+                fi
+            done
+        fi
+        if [[ "$docker_repaired" == true ]]; then
+            checked_dirs+=("$cache_dir")
+            continue
+        fi
+
+        echo "Docker repair unavailable or unsuccessful; trying sudo..." >&2
+        # Do not follow cache symlinks to files outside this tree.
+        if ! sudo "${sudo_args[@]}" chown -R -h -- "$owner" "$cache_dir"; then
+            echo "Error: Could not repair cache ownership: $cache_dir" >&2
+            echo "Rerun from an interactive terminal to enter a sudo password, or repair this cache manually." >&2
+            return 1
+        fi
+        if ! mismatch=$(find "$cache_dir" ! -uid "$owner_uid" -print -quit) || [[ -n "$mismatch" ]]; then
+            echo "Error: Cache ownership is still incorrect or unreadable: $cache_dir" >&2
+            return 1
+        fi
+        checked_dirs+=("$cache_dir")
+    done
+}
+
+prepare_remote_cache() {
+    local host="$1" remote_script remote_command
+    local ssh_args=(-o BatchMode=yes)
+    if [[ -t 0 ]]; then
+        ssh_args+=(-t)
+    else
+        ssh_args+=(-nT)
+    fi
+    # Pass the script as an argument, leaving stdin available for sudo's password.
+    printf -v remote_script '%s\nrepair_cache_ownership "$@"' "$(declare -f repair_cache_ownership)"
+    printf -v remote_command 'bash -c %q -- %q %q' "$remote_script" "$HF_CACHE_DIR" "$HUB_PATH"
+    echo "Checking cache ownership on ${SSH_USER}@${host}..."
+    if ! ssh "${ssh_args[@]}" "${SSH_USER}@${host}" "$remote_command"; then
+        echo "Error: Cache preparation failed on ${SSH_USER}@${host}." >&2
+        return 1
+    fi
 }
 
 add_copy_hosts() {
@@ -48,7 +157,8 @@ copy_model_to_host() {
     # The trailing slash makes the model directory the transfer root: preserve
     # snapshot links, but materialize links to hub-level blobs as repo-local files.
     # Downside is duplication of storage if cross-model shared blobs are used, but basically replicates old behavior.
-    if rsync -av --mkpath --progress --copy-unsafe-links \
+    # -s protects remote paths containing spaces or shell metacharacters.
+    if rsync -av -s --mkpath --progress --copy-unsafe-links \
             "$model_dir/" "${SSH_USER}@${host}:$HUB_PATH/$(basename "$model_dir")/"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
@@ -146,6 +256,11 @@ fi
 # Start time tracking
 START_TIME=$(date +%s)
 
+# Resolve the same paths as hf, including its legacy Hub cache override.
+HF_CACHE_DIR=$(resolve_cache_path home)
+HUB_PATH=$(resolve_cache_path hub)
+repair_cache_ownership "$HF_CACHE_DIR" "$HUB_PATH"
+
 # Download model
 echo "Downloading model '$MODEL_NAME' using uvx..."
 DOWNLOAD_START=$(date +%s)
@@ -192,7 +307,7 @@ fi
 
 if [ -z "$MODEL_DIR" ]; then
     echo "Error: Could not find downloaded model directory in $HUB_PATH"
-    echo "Please check the ~/.cache/huggingface/hub directory manually."
+    echo "Please check the $HUB_PATH directory manually."
     exit 1
 fi
 
@@ -207,6 +322,11 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
         echo "Parallel copy enabled."
     fi
     COPY_START=$(date +%s)
+
+    # Finish all sudo prompts in the foreground, even when transfers run in parallel.
+    for host in "${COPY_HOSTS[@]}"; do
+        prepare_remote_cache "$host"
+    done
 
     if [ "$PARALLEL_COPY" = true ]; then
         PIDS=()

@@ -2443,6 +2443,7 @@ The `hf-download.sh` script provides a convenient way to download models from Hu
 ### Prerequisites
 
 - `uvx` must be installed (the script will prompt you to install it if missing).
+- Python 3 is used to resolve Hugging Face cache paths.
 - Passwordless SSH access to other nodes (if copying).
 
 ### Usage
@@ -2473,16 +2474,25 @@ The `hf-download.sh` script provides a convenient way to download models from Hu
 
 When `-c` is given without explicit hosts, the script checks `COPY_HOSTS` in `.env` first, then falls back to autodiscovery. In mesh mode this means transfers go over the direct IB-attached interfaces automatically.
 
-If distribution fails with permission errors under `~/.cache`, verify ownership
-on every node. When root-owned cache files are the cause and the cache should
-belong to the login user, run this locally on each node:
+Before downloading, the script checks for cache entries owned by another user
+(for example, root-owned files created by vLLM). If needed, it first tries an
+existing `vllm-node` image, then `vllm-node-b12x`, using the local system Docker
+daemon. It runs a temporary container with only the affected cache directory
+mounted and `chown` as its entrypoint, setting ownership to the host user's
+numeric UID. No images are pulled. If Docker is unavailable or cannot repair
+ownership, it falls back to `sudo chown -R` for the current login user.
+It checks `HF_HOME` (default: `~/.cache/huggingface`, or
+`$XDG_CACHE_HOME/huggingface`) and the Hub cache selected by `HF_HUB_CACHE`,
+then the legacy `HUGGINGFACE_HUB_CACHE`, then `$HF_HOME/hub`.
+These follow [Hugging Face's cache environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables).
 
-```bash
-sudo chown -R "$USER" "$HOME/.cache"
-```
-
-This is a privileged recursive change; confirm the target and ownership problem
-before running it. If `HF_HOME` points elsewhere, repair that cache path instead.
+With `-c`, it also checks and repairs those same absolute cache paths on every
+destination node, using the SSH login user as owner. Sudo may prompt for a
+password on nodes where Docker repair does not succeed. These checks run
+serially before any transfers, including with `--copy-parallel`. Without an
+interactive terminal, repairs require working Docker access or passwordless
+sudo. Ownership is verified after repair; if it remains incorrect, the script
+stops with an error.
 
 **Manual host fallback:**
 
