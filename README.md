@@ -2442,13 +2442,23 @@ I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new b
 
 ## 10\. Downloading Models
 
-The `hf-download.sh` script provides a convenient way to download models from HuggingFace and distribute them across your cluster nodes. It uses Huggingface CLI via `uvx` for fast downloads and `rsync` for distribution across the cluster.
+The `hf-download.sh` script downloads, lists, removes, backs up, and restores
+Hugging Face models locally or across the cluster. It uses the Hugging Face CLI
+via `uvx` and `rsync` for model transfers.
 
 ### Prerequisites
 
-- `uvx` must be installed (the script will prompt you to install it if missing).
-- Python 3 is used to resolve Hugging Face cache paths.
-- Passwordless SSH access to other nodes (if copying).
+- The script checks for `uvx` on the head and affected peers, including
+  `~/.local/bin` and `~/.cargo/bin` when they are absent from SSH's `PATH`.
+  If missing, it installs uv (which includes `uvx`) into the current user's
+  `~/.local/bin` using the [official installer](https://docs.astral.sh/uv/getting-started/installation/).
+  This needs internet access and `curl` or `wget` on that node. Installation
+  does not use sudo or modify shell profiles; setup messages go to stderr.
+- Python 3.10+ is used for cache paths, inventory, and backup management.
+- `rsync` 3.2.3+ is required for distribution; local backups and restores also use `rsync`.
+- Passwordless SSH access to other nodes (with `-c`). Listing, deletion, and
+  cleanup require Python on each node; `uvx` is prepared automatically. Use a recent Hugging Face CLI
+  that supports `hf cache ls --revisions --format json --sort` and `hf cache rm`.
 
 ### Usage
 
@@ -2513,14 +2523,142 @@ the topology:
 ./hf-download.sh --config /path/to/cluster.env -c QuantTrio/MiniMax-M2-AWQ
 ```
 
+### Cache management
+
+**List models locally or across the cluster:**
+
+```bash
+./hf-download.sh --list
+./hf-download.sh --list -c
+./hf-download.sh --list -c --format json --sort name
+./hf-download.sh --list -c --format csv > models.csv
+./hf-download.sh --list -c --format md
+```
+
+Each revision appears separately, including models found only on peers. With
+`-c`, the nodes column identifies every node holding that revision. Size is in
+decimal GB (1 GB = 1,000,000,000 bytes), counting each blob once per revision.
+For a revision present on multiple nodes, the size shown is the largest cached
+copy, rather than the sum across nodes; partial downloads can differ by node.
+Revisions may share blobs, so summing rows is not total physical disk usage.
+
+`--format` accepts `console` (default), `csv`, `json`, or `md`. JSON and CSV
+include `model`, `revision`, and `size_gb`; cluster listings also include `nodes`
+(a JSON array or semicolon-separated CSV field). Diagnostics go to stderr.
+`--sort` is passed to `uvx hf cache ls` on each node, then applied to the combined
+inventory. It accepts `size`, `name`, `accessed`, or `modified`, optionally
+followed by `:asc` or `:desc`. The default is `size:desc`. For time sorting,
+the most recent timestamp across copies is used.
+
+**Delete a model, including all cached revisions:**
+
+```bash
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ -c
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ -c --force
+# Delete only one cached revision (use the hash printed by --list):
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ --revision COMMIT_HASH -c
+```
+
+Deletion asks once for confirmation covering the local node and selected peers.
+`--force` skips that prompt. An unavailable node aborts the inventory step
+before deletion starts; failures during deletion return a nonzero status.
+
+`--revision` selects one cached commit, retaining the model's other revisions
+and any blobs they still use. It accepts a full commit hash, a unique hash
+prefix of at least seven characters, or a cached branch/tag such as `main`.
+The selector is resolved across the selected nodes before confirmation; an
+unknown or ambiguous selector fails without deleting anything. If `main`
+points to different commits on different nodes, specify a commit hash instead.
+Nodes without the resolved commit are skipped. Revision deletion is refused
+if that hash also belongs to another cached repository on an affected node,
+because Hugging Face's hash-based removal can affect other repositories.
+
+**Back up to an existing directory on a mounted drive on the head node:**
+
+```bash
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models --delete -c
+# Back up just the revision currently referenced by main on the head:
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --revision main --backup-dir /mnt/ssd/models
+```
+
+Backup copies all revisions available on the head into
+`<backup-dir>/models--<org>--<model>`, preserving snapshot links and copying any
+shared Hub blobs into the backup. The result is self-contained and requires a
+filesystem supporting symlinks. A backup is published only after the copy
+succeeds and its links and refs validate. Existing backups are preserved;
+choose a different backup directory to make another backup of the same model.
+The backup directory must be outside the Hub cache, and must already exist.
+
+With `--revision`, backup includes only the selected head-node snapshot, its
+required blobs, and refs/metadata for that commit. It uses the same cache layout,
+so `--list-backup` and `--restore` work as usual. Without `--revision`, backup
+and deletion continue to select every cached revision of the model.
+
+`--delete` runs only after a successful backup and follows the usual confirmation
+and `--force` behavior. With `-c`, it first checks that the backup covers every
+selected node's revision and cached files. If a peer has a revision or file
+missing from the head's backup, deletion is refused on all nodes and the backup
+is kept. Back up those additional revisions from a head that has them before
+removing their cached copies.
+
+For `--backup --revision ... --delete -c`, the head's selector is resolved once
+to a commit hash. Coverage checks and deletion apply only to that commit on
+each node; other revisions remain, even if a peer's `main` points elsewhere.
+
+**List backups and restore a selected model:**
+
+```bash
+./hf-download.sh --list-backup --backup-dir /mnt/ssd/models
+./hf-download.sh --list-backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models --format json
+./hf-download.sh --restore QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models
+./hf-download.sh --restore QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models -c --copy-parallel
+```
+
+Backup listing supports the same formats and sorting as `--list`; the model
+argument is optional. Restore copies the saved revisions and refs into the
+head's cache, retaining additional revisions already there, and leaves the
+backup intact. With `-c`, it distributes the resulting model directory through
+the same SSH, ownership preparation, and serial/parallel rsync path as download.
+
+**Clean up unreferenced model revisions:**
+
+```bash
+./hf-download.sh --cleanup
+./hf-download.sh --cleanup -c
+./hf-download.sh --cleanup -c --force
+```
+
+Cleanup removes model revisions that have no branch or tag refs, retaining
+referenced revisions and datasets/Spaces. It asks for confirmation unless
+`--force` is specified. Because Hugging Face revision deletion uses global
+hashes, a hash also used by a referenced revision or non-model repository is
+retained. This operation does not remove incomplete downloads or clear the
+entire cache.
+
+All cluster operations use the same `-c` host selection described above. Put
+unqualified model IDs (such as `gpt2`) before `-c` so they are not read as host
+names. Without `-c`, saved `COPY_HOSTS` do not trigger remote operations.
+
 **Available options:**
 
 | Flag | Description |
 | :--- | :--- |
-| `<model-name>` | HuggingFace model ID (e.g. `QuantTrio/MiniMax-M2-AWQ`). Required. |
-| `-c, --copy-to <hosts>` | Host(s) to copy the model to after download (space- or comma-separated). Omit hosts to use `COPY_HOSTS` from `.env` or autodiscovery. |
+| `<model-name>` | Hugging Face model ID. Required for download, delete, backup, and restore; optional for backup listing. |
+| `--list` | List cached model revisions. |
+| `--delete` | Delete the model; combine with `--backup` to delete after a successful backup. |
+| `--backup`, `--restore` | Copy a model to/from `--backup-dir`. |
+| `--list-backup` | List saved model revisions in `--backup-dir`. |
+| `--backup-dir <path>` | Existing head-node backup directory. |
+| `--cleanup` | Remove unreferenced model revisions. |
+| `--force` | Skip deletion or cleanup confirmation. |
+| `--revision <revision>` | With `--backup` or `--delete`, select one cached commit by hash, unique prefix (7+ characters), or branch/tag. |
+| `--format <format>` | Listing format: `console`, `csv`, `json`, or `md`. |
+| `--sort <order>` | Listing sort passed to `hf cache ls` (default: `size:desc`). |
+| `-c, --copy-to [hosts]` | Include peer nodes (space- or comma-separated). Omit hosts to use `COPY_HOSTS` from `.env` or autodiscovery. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
-| `--copy-parallel` | Copy to all hosts concurrently instead of serially. |
+| `--copy-parallel` | With `-c`, distribute downloads or restores concurrently. |
 | `-u, --user <user>` | SSH username for remote copies (default: current user). |
 | `--config <file>` | Path to `.env` configuration file (default: `.env` in script directory). |
 | `-h, --help` | Show help message. |
