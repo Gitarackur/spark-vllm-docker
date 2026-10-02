@@ -58,6 +58,14 @@ Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
 `-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
 out.
 
+Regular and B12X source builds include a targeted patch based on
+[vLLM PR #58028](https://github.com/vllm-project/vllm/pull/58028). When `--api-key`
+is configured, the Python frontend requires authentication for every route
+except `/health`, `/ping`, `/load`, and `/version`; CORS preflight requests also
+remain exempt. This includes protecting `/metrics`, `/tokenize`, and the API
+docs. The patch is included in exported vLLM wheels and leaves the Rust
+frontend unchanged.
+
 B12X autotuning is disabled by default with `B12X_AUTOTUNE=0` on all GPU
 architectures. Pass `-e B12X_AUTOTUNE=1` to enable it for a launch.
 
