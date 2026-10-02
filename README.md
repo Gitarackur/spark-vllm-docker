@@ -332,6 +332,8 @@ commit by hash, unique prefix, branch, or tag. `--backup --delete` removes cache
 copies only after a successful backup and coverage checks. Deletion and cleanup
 ask for confirmation unless `--force` is supplied, and missing `uvx`
 installations are now handled automatically on the head and peer nodes.
+Backups automatically use regular snapshot files on external drives without
+symlink support, with the same listing, restore, and revision selection commands.
 
 ### 2026-09-30
 
@@ -2612,10 +2614,18 @@ because Hugging Face's hash-based removal can affect other repositories.
 ```
 
 Backup copies all revisions available on the head into
-`<backup-dir>/models--<org>--<model>`, preserving snapshot links and copying any
-shared Hub blobs into the backup. The result is self-contained and requires a
-filesystem supporting symlinks. A backup is published only after the copy
-succeeds and its links and refs validate. Existing backups are preserved;
+`<backup-dir>/models--<org>--<model>`. On filesystems supporting symlinks, it
+preserves snapshot links and copies any shared Hub blobs into the backup.
+The script tests the destination's symlink support before copying. On external
+drives that cannot create symlinks, it saves regular files inside each snapshot
+and omits the separate blob directory to avoid storing the same weights twice.
+This fallback also skips Unix ownership and permission preservation. Revisions
+that share weights can require more space because each snapshot has its own
+files. Both layouts are self-contained and work with `--list-backup`,
+`--restore`, and `--backup --delete`. The same fallback applies to backups
+selected with `--revision`.
+A backup is published only after the copy succeeds and its files, links, and
+refs validate. Existing backups are preserved;
 choose a different backup directory to make another backup of the same model.
 The backup directory must be outside the Hub cache, and must already exist.
 

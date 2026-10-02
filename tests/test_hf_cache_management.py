@@ -68,6 +68,16 @@ if tool == "rsync":
         if peer == os.environ.get("TEST_FAIL_COPY"):
             sys.exit(23)
         args[-1] = str(Path(mapping[peer]) / Path(destination.rstrip("/")).name) + "/"
+    portable_root = os.environ.get("TEST_NO_SYMLINK_ROOT")
+    if portable_root and Path(args[-1]).is_relative_to(portable_root):
+        # Simulate a drive that rejects symlinks and Unix ownership/mode options,
+        # while still using real rsync for the resulting file transfer.
+        if "-a" in args or any(arg in args for arg in ("--perms", "--owner", "--group")):
+            sys.exit("Destination does not support Unix file attributes")
+        result = subprocess.run([os.environ["TEST_RSYNC"], *args])
+        if any(path.is_symlink() for path in Path(args[-1]).rglob("*")):
+            sys.exit("Destination does not support symlinks")
+        sys.exit(result.returncode)
     os.execv(os.environ["TEST_RSYNC"], ["rsync", *args])
 assert tool == "uvx", (tool, args)
 if args[:2] == ["hf", "download"]:
@@ -181,6 +191,102 @@ class CacheManagementTests(unittest.TestCase):
     def calls(self, tool="uvx", action=None):
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
         return [c for c in calls if c["tool"] == tool and (action is None or c["args"][2] == action)]
+
+    def backup_without_symlinks(self, error="EPERM"):
+        # Inject only the filesystem limitation; the real helper must choose
+        # its fallback. Every cache and install remains in this test's tempdir.
+        hook = self.root / "python-hooks"
+        hook.mkdir()
+        (hook / "sitecustomize.py").write_text('''
+import errno
+import os
+from pathlib import Path
+
+original_symlink = os.symlink
+def limited_symlink(src, dst, *args, **kwargs):
+    if Path(dst).is_relative_to(os.environ["TEST_NO_SYMLINK_ROOT"]):
+        code = getattr(errno, os.environ["TEST_SYMLINK_ERRNO"])
+        raise OSError(code, os.strerror(code), str(dst))
+    return original_symlink(src, dst, *args, **kwargs)
+os.symlink = limited_symlink
+''')
+        self.env["PYTHONPATH"] = str(hook)
+        self.env["TEST_NO_SYMLINK_ROOT"] = str(self.backup)
+        self.env["TEST_SYMLINK_ERRNO"] = error
+
+    def test_portable_backup_delete_list_restore_and_distribute(self):
+        self.backup_without_symlinks()
+        first, second = "a" * 40, "b" * 40
+        repo = self.model(shared=True)
+        self.model(revision=second, referenced=False)
+        self.model(self.peer1)
+        # Both revisions share one payload, and the second has its own payload.
+        (repo / "snapshots" / second / "common.safetensors").symlink_to("../../blobs/" + first)
+        result = self.run_script("--backup", "org/model", "--backup-dir", str(self.backup),
+                                 "--delete", "-c", "--force")
+        self.assertIn("backing up regular snapshot files", result.stderr)
+        self.assertFalse(repo.exists())
+        saved = self.backup / repo.name
+        self.assertFalse(any(path.is_symlink() for path in self.backup.rglob("*")))
+        self.assertFalse((saved / "blobs").exists())
+        self.assertEqual((saved / "refs/main").read_text(), first)
+        for revision in (first, second):
+            self.assertEqual((saved / "snapshots" / revision / "model.safetensors").read_bytes(), b"weights")
+        shutil.rmtree(self.hub / "blobs")
+        rows = json.loads(self.run_script("--list-backup", "--backup-dir", str(self.backup), "--format", "json").stdout)
+        self.assertEqual({row["revision"] for row in rows}, {first, second})
+        # Restore merges into an existing cache as well as copying to empty peers.
+        self.model(revision="c" * 40)
+        self.run_script("--restore", "org/model", "--backup-dir", str(self.backup), "-c", "--copy-parallel")
+        for cache in (self.hub, self.peer1, self.peer2):
+            self.assertEqual((cache / repo.name / "snapshots" / second / "common.safetensors").read_bytes(), b"weights")
+            self.assertTrue((cache / repo.name / "snapshots" / ("c" * 40)).exists())
+
+    def test_portable_backup_selected_revision_only(self):
+        self.backup_without_symlinks("EOPNOTSUPP")
+        first, second = "a" * 40, "b" * 40
+        repo = self.model(shared=True)
+        self.model(revision=second)
+        snapshot = repo / "snapshots" / first
+        (snapshot / "nested").mkdir()
+        (snapshot / "nested/weights.safetensors").symlink_to("../../../blobs/" + first)
+        (snapshot / "config.json").write_text('{}')
+        metadata = repo / ".no_exist" / first
+        metadata.mkdir(parents=True)
+        (metadata / "optional.json").touch()
+        self.run_script("--backup", "org/model", "--revision", first, "--backup-dir", str(self.backup),
+                        "--delete", "--force")
+        saved = self.backup / repo.name
+        self.assertEqual([path.name for path in (saved / "snapshots").iterdir()], [first])
+        self.assertFalse((saved / "blobs").exists())
+        self.assertFalse((saved / "refs/main").exists())
+        self.assertTrue((saved / ".no_exist" / first / "optional.json").is_file())
+        self.assertFalse((repo / "snapshots" / first).exists())
+        self.assertTrue((repo / "snapshots" / second).exists())
+        shutil.rmtree(repo)
+        shutil.rmtree(self.hub / "blobs")
+        self.run_script("--restore", "org/model", "--backup-dir", str(self.backup))
+        self.assertEqual((repo / "snapshots" / first / "nested/weights.safetensors").read_bytes(), b"weights")
+
+    def test_failed_portable_backup_never_deletes_or_publishes(self):
+        self.backup_without_symlinks()
+        repo = self.model()
+        self.env["TEST_FAIL_RSYNC"] = "1"
+        self.run_script("--backup", "org/model", "--backup-dir", str(self.backup),
+                        "--delete", "--force", success=False)
+        self.assertTrue(repo.exists())
+        self.assertFalse(any(self.backup.iterdir()))
+        self.assertFalse(self.calls(action="rm"))
+
+    def test_probe_io_error_aborts_instead_of_trying_portable_copy(self):
+        self.backup_without_symlinks("EIO")
+        repo = self.model()
+        self.run_script("--backup", "org/model", "--backup-dir", str(self.backup),
+                        "--delete", "--force", success=False)
+        self.assertTrue(repo.exists())
+        self.assertFalse(self.calls("rsync"))
+        self.assertFalse(self.calls(action="rm"))
+        self.assertFalse(any(self.backup.iterdir()))
 
     def remote_without_uvx(self, peer="peer1", downloader="curl", existing=None):
         # Isolate PATH completely so tests never discover or install real uv.

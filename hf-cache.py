@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import errno
 import json
 import os
 from pathlib import Path
@@ -218,6 +219,20 @@ def revision_files(source, revision):
     return sorted(path.relative_to(source).as_posix() for path in paths)
 
 
+def supports_symlinks(directory):
+    """Probe inside our private staging directory, without touching user files."""
+    probe = directory / ".symlink-probe"
+    try:
+        probe.symlink_to(".", target_is_directory=True)
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.EACCES, errno.EOPNOTSUPP, errno.ENOSYS):
+            return False
+        raise
+    else:
+        probe.unlink()
+        return True
+
+
 def transfer(cache, backup, model, restore=False, revision=""):
     cache, backup = cache.resolve(), backup.resolve(strict=True)
     if not backup.is_dir():
@@ -238,6 +253,15 @@ def transfer(cache, backup, model, restore=False, revision=""):
     with tempfile.TemporaryDirectory(prefix=".hf-transfer-", dir=destination_root) as temporary:
         staged = Path(temporary) / source.name
         staged.mkdir()
+        copy_options = ["-a", "--copy-unsafe-links"]
+        if not restore and not supports_symlinks(Path(temporary)):
+            print("Destination symlinks are unavailable; backing up regular snapshot files.", file=sys.stderr)
+            # Flat snapshots are a supported Hub cache layout. Dereference the
+            # snapshot links and omit the separate blobs to avoid two copies of
+            # every weight. These drives may also lack Unix ownership/permissions.
+            copy_options = ["-t", "--dirs", "--copy-links", "--exclude=/blobs/***"]
+            if not revision:
+                copy_options.append("--recursive")
         options = []
         if revision:
             # With --files-from, -a does not imply recursion. Only these files
@@ -245,7 +269,7 @@ def transfer(cache, backup, model, restore=False, revision=""):
             file_list = Path(temporary) / "files"
             file_list.write_bytes(b"\0".join(os.fsencode(path) for path in revision_files(source, revision)) + b"\0")
             options = ["--from0", f"--files-from={file_list}"]
-        subprocess.run(["rsync", "-a", "--copy-unsafe-links", "--exclude=*.incomplete", *options,
+        subprocess.run(["rsync", *copy_options, "--exclude=*.incomplete", *options,
                         str(source) + "/", str(staged) + "/"], check=True)
         validate_tree(staged, staged)
         if restore and destination.exists():
