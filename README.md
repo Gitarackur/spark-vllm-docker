@@ -313,6 +313,26 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-10-02
+
+`hf-download.sh` now supports model cache management locally and across the
+cluster: list models and revisions with `--list`, remove selected models with
+`--delete`, and reclaim space from unreferenced revisions with `--cleanup`.
+Add `-c` to extend these operations to all selected cluster nodes. It also
+enables cluster distribution for downloads and restores, and extends deletion
+after backup (`--backup --delete`) to peer nodes. Backups and backup listings
+use the head node's directory.
+
+Listings include model sizes and node locations, with sorting and console,
+CSV, JSON, or Markdown output. Use `--backup` with `--backup-dir` to save models
+to a mounted directory on the head node, `--list-backup` to inspect backups,
+and `--restore` to restore and optionally distribute them with `-c` and
+`--copy-parallel`. Backup and deletion accept `--revision` to select a cached
+commit by hash, unique prefix, branch, or tag. `--backup --delete` removes cached
+copies only after a successful backup and coverage checks. Deletion and cleanup
+ask for confirmation unless `--force` is supplied, and missing `uvx`
+installations are now handled automatically on the head and peer nodes.
+
 ### 2026-09-30
 
 `./hf-download.sh` will now try to check and automatically repair cache permissions before downloading or distributing the model across the nodes.
