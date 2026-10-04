@@ -1,0 +1,79 @@
+diff --git a/vllm/models/qwen4_exp/nvidia/b12x_qsa.py b/vllm/models/qwen4_exp/nvidia/b12x_qsa.py
+--- a/vllm/models/qwen4_exp/nvidia/b12x_qsa.py
++++ b/vllm/models/qwen4_exp/nvidia/b12x_qsa.py
+@@ -248,6 +248,7 @@ def build(
+         qsa_state_is_fresh: torch.Tensor | None = None,
+         qsa_num_accepted_tokens: torch.Tensor | None = None,
+         qsa_is_prefilling: torch.Tensor | None = None,
++        qsa_max_seq_len: int | None = None,
+     ) -> Qwen4ExpQSAMetadata:
+         del common_prefix_len, fast_build
+         cm = common_attn_metadata
+@@ -281,7 +282,7 @@ def build(
+             num_actual_tokens=cm.num_actual_tokens,
+             max_query_len=cm.max_query_len,
+             query_start_loc=cm.query_start_loc,
+-            max_seq_len=cm.max_seq_len,
++            max_seq_len=cm.max_seq_len if qsa_max_seq_len is None else qsa_max_seq_len,
+             seq_lens=cm.seq_lens,
+             block_table=cm.block_table_tensor,
+             slot_mapping=cm.slot_mapping,
+diff --git a/vllm/models/qwen4_exp/nvidia/model_state.py b/vllm/models/qwen4_exp/nvidia/model_state.py
+--- a/vllm/models/qwen4_exp/nvidia/model_state.py
++++ b/vllm/models/qwen4_exp/nvidia/model_state.py
+@@ -37,6 +37,9 @@ class Qwen4ExpAttnMetadata(MambaHybridAttnMetadata):
+     qsa_state_is_fresh: torch.Tensor | None = None
+     qsa_num_accepted_tokens: torch.Tensor | None = None
+     qsa_is_prefilling: torch.Tensor | None = None
++    # Set during CUDA graph capture: B12X QSA selects and stages its context
++    # inside PIECEWISE graphs, so the captured context must cover max_model_len.
++    qsa_max_seq_len: int | None = None
+ 
+     def get_extra_attn_kwargs(
+         self,
+@@ -55,6 +58,7 @@ def get_extra_attn_kwargs(
+             qsa_state_is_fresh=self.qsa_state_is_fresh[:num_reqs],
+             qsa_num_accepted_tokens=self.qsa_num_accepted_tokens[:num_reqs],
+             qsa_is_prefilling=self.qsa_is_prefilling[:num_reqs],
++            qsa_max_seq_len=self.qsa_max_seq_len,
+         )
+         return kwargs
+ 
+@@ -374,6 +378,11 @@ def prepare_attn(
+             qsa_state_is_fresh=qsa_state_is_fresh,
+             qsa_num_accepted_tokens=qsa_num_accepted_tokens,
+             qsa_is_prefilling=qsa_is_prefilling,
++            qsa_max_seq_len=(
++                self.max_model_len
++                if for_capture or input_batch.cudagraph_capture
++                else None
++            ),
+         )
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -1087,6 +1087,7 @@ def prepare_inputs_to_capture(
+         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
+ 
+     input_batch.uniform_decode_graph = full_cudagraph and uniform_decode_graph
++    input_batch.cudagraph_capture = True
+ 
+     block_table_provider = pcp_manager or block_tables
+     input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -127,6 +127,11 @@ class InputBatch:
+     # from dummy query lengths: a mixed graph may be captured with uniform rows.
+     uniform_decode_graph: bool = False
+ 
++    # Dummy batch for any CUDA graph capture, FULL or PIECEWISE. Operations
++    # recorded inside a PIECEWISE graph must size their metadata for every
++    # replay, not for the dummy sequence lengths.
++    cudagraph_capture: bool = False
++
+     @classmethod
+     def make_dummy(
+         cls,

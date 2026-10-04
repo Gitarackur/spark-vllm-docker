@@ -1611,8 +1611,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 17 ]; then
-        fail "Expected 17 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 18 ]; then
+        fail "Expected 18 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1664,6 +1664,13 @@ test_b12x_moe_tuning_memory_patch() {
         fail "B12X MoE trial-buffer lifetime regression tests failed"
     fi
     pass "B12X MoE releases trial buffers before KV cache profiling"
+}
+
+test_qwen38_qsa_capture_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_qwen38_qsa_capture_patch.py"; then
+        fail "Qwen3.8 QSA capture patch regression tests failed"
+    fi
+    pass "B12X QSA capture fix is applied before wheel compilation and fails on conflicts"
 }
 
 test_startup_heap_trim_patch() {
@@ -1767,6 +1774,7 @@ test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch
 test_b12x_moe_tuning_memory_patch
+test_qwen38_qsa_capture_patch
 test_startup_heap_trim_patch
 test_b12x_cache_integrity_patch
 

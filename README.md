@@ -66,8 +66,6 @@ remain exempt. This includes protecting `/metrics`, `/tokenize`, and the API
 docs. The patch is included in exported vLLM wheels and leaves the Rust
 frontend unchanged.
 
-B12X autotuning is disabled by default with `B12X_AUTOTUNE=0` on all GPU
-architectures. Pass `-e B12X_AUTOTUNE=1` to enable it for a launch.
 
 ## QUICK START (USING RECIPES)
 

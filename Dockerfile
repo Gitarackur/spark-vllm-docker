@@ -546,6 +546,14 @@ RUN python3 /tmp/vllm-patches/patch_vllm_swa_block_size.py .
 # the equivalent upstream fix.
 RUN python3 /tmp/vllm-patches/patch_vllm_mrv2_speculator_cudagraph_pool.py .
 
+# TEMPORARY PATCH: https://github.com/local-inference-lab/vllm/pull/865
+# B12X QSA PIECEWISE graphs can capture undersized cache tables and corrupt
+# cached continuations. Apply the pinned runtime PR diff only to the B12X
+# fork, before wheel compilation. Skip known equivalent upstream fixes;
+# missing/incompatible source or a failed patch must fail the build.
+COPY docker/vllm-qwen38-qsa-capture-pr865.patch /tmp/vllm-patches/
+RUN python3 /tmp/vllm-patches/patch_vllm_qwen38_qsa_capture.py . --repo "$VLLM_REPO"
+
 # TEMPORARY PATCH: local-inference-lab/vllm commit ad848fc41 added a dynamic
 # DeepSeek V4 C128A top-k width but omitted the alignment constant import.
 # Keep this B12X-only and source-aware so it skips refs where the bug is absent
