@@ -1432,8 +1432,7 @@ EARLYOOM_SETUP
     fi
 }
 
-# Verify that the selected image resolves to the same content-addressable image
-# ID on the head and every worker before starting any containers.
+# Verify matching IDs or equivalent image content before starting containers.
 verify_cluster_image_consistency() {
     if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
         return 0
@@ -1454,6 +1453,8 @@ verify_cluster_image_consistency() {
 
     local worker
     local worker_image_id
+    local head_fingerprint="" worker_fingerprint
+    local head_fingerprint_checked=false
     local image_error=false
     for worker in "${PEER_NODES[@]}"; do
         if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
@@ -1461,6 +1462,30 @@ verify_cluster_image_consistency() {
             echo "       The image may be missing or inaccessible to the remote user."
             image_error=true
         elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            # IDs can represent configs, manifests, or indexes depending on the
+            # Docker image store. Fingerprint the resolved image content locally;
+            # workers need only Docker, not Python or a repository checkout.
+            if [[ "$head_fingerprint_checked" == "false" ]]; then
+                head_fingerprint_checked=true
+                head_fingerprint=$(
+                    set -o pipefail
+                    docker image inspect "$head_image_id" |
+                        python3 "$SCRIPT_DIR/docker/image_identity.py"
+                ) 2>/dev/null || head_fingerprint=""
+            fi
+            if [[ -n "$head_fingerprint" ]]; then
+                local content_inspect_cmd
+                printf -v content_inspect_cmd 'docker image inspect %q' "$worker_image_id"
+                worker_fingerprint=$(
+                    set -o pipefail
+                    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$content_inspect_cmd" |
+                        python3 "$SCRIPT_DIR/docker/image_identity.py"
+                ) 2>/dev/null || worker_fingerprint=""
+                if [[ "$worker_fingerprint" == "$head_fingerprint" ]]; then
+                    echo "  [WORKER] $worker: $worker_image_id (matching image content)"
+                    continue
+                fi
+            fi
             echo "Error: Docker image mismatch on worker node ($worker):"
             echo "       Head:   $head_image_id"
             echo "       Worker: $worker_image_id"

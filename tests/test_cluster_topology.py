@@ -155,11 +155,19 @@ with open(os.environ["TOPOLOGY_TEST_LOG"], "a") as log:
     log.write(json.dumps(record) + "\n")
 if tool == "docker":
     if args[:2] == ["image", "inspect"]:
-        print("sha256:current")
+        if "--format" in args:
+            print("sha256:current")
+        else:
+            print(pathlib.Path(os.environ["TOPOLOGY_TEST_IMAGE"]).read_text())
     elif args[0] == "save":
         pathlib.Path(args[args.index("-o") + 1]).write_bytes(b"mock image stream")
 elif tool == "ssh" and "docker image inspect" in args[-1]:
-    print("sha256:old" if "-F" in args else "sha256:current")
+    if "--format" in args[-1]:
+        print("sha256:old" if "-F" in args else "sha256:current")
+    else:
+        image = json.loads(pathlib.Path(os.environ["TOPOLOGY_TEST_IMAGE"]).read_text())
+        image[0]["Config"]["Cmd"] = ["different-runtime"]
+        print(json.dumps(image))
 elif tool == "ssh" and args[-1].startswith("docker ps"):
     sys.exit(1)
 if os.environ.get("TOPOLOGY_FAIL_COPY") and (tool == "rsync" or (tool == "ssh" and args[-1] == "docker load")):
@@ -174,6 +182,8 @@ class IntegrationTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         for name in ("autodiscover.sh", "build-and-copy.sh", "hf-download.sh", "hf-cache.py", "cluster_topology.py", "launch-cluster.sh"):
             shutil.copy2(ROOT / name, self.root / name)
+        (self.root / "docker").mkdir()
+        shutil.copy2(ROOT / "docker/image_identity.py", self.root / "docker/image_identity.py")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for tool in ("ssh", "docker", "rsync", "uvx", "sleep"):
@@ -184,7 +194,8 @@ class IntegrationTests(unittest.TestCase):
         self.config.write_text(config())
         self.log = self.root / "calls.jsonl"
         self.env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
-                    "TOPOLOGY_TEST_LOG": str(self.log), "HF_HOME": str(self.root / "cache"), "USER": "fixture"}
+                    "TOPOLOGY_TEST_LOG": str(self.log), "HF_HOME": str(self.root / "cache"), "USER": "fixture",
+                    "TOPOLOGY_TEST_IMAGE": str(ROOT / "tests/fixtures/image-identity/classic.json")}
         for key in list(self.env):
             if key.startswith("DOTENV_") or key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
                 del self.env[key]
@@ -209,7 +220,7 @@ class IntegrationTests(unittest.TestCase):
     def test_image_inspection_and_stream_use_same_routes(self):
         self.run_script("build-and-copy.sh", "--config", str(self.config), "--no-build", "-c", "--copy-parallel")
         calls = [call for call in self.calls() if call["tool"] == "ssh"]
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 9)
         for call in calls:
             self.assert_route(call)
         self.assertEqual({call["args"][-2] for call in calls}, set(ORDER[1:]))
@@ -240,7 +251,7 @@ class IntegrationTests(unittest.TestCase):
                     permissions = [call for call in calls if call["tool"] == "ssh" and call not in inspections + streams]
                     copies = [call for call in calls if call["tool"] == "rsync"]
                     for group in (inspections, streams, permissions, copies):
-                        self.assertEqual(len(group), count - 1)
+                        self.assertEqual(len(group), (count - 1) * (2 if group is inspections else 1))
                         destinations = {call["args"][-1].split(":", 1)[0] if call["tool"] == "rsync"
                                         else call["args"][-2] for call in group}
                         self.assertEqual(destinations, set(nodes[1:]))

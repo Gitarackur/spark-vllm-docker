@@ -1680,6 +1680,14 @@ nodes in the cluster and excludes the current node.
 `COPY_HOSTS` from `.env` or autodiscovery; `--copy-parallel` transfers to all
 resolved hosts concurrently.
 
+Hosts with matching image IDs are skipped. If IDs differ, the scripts compare
+the image's platform, ordered filesystem layer hashes, and runtime configuration.
+This recognizes equivalent images across classic Docker and containerd image
+stores, including locally built or saved/loaded images without registry digests.
+The same check runs before cluster launch. It requires Python 3 on the head
+only; workers need Docker. If content cannot be verified, distribution copies
+the image and cluster launch rejects differing IDs.
+
 **Manual host fallback:**
 
 Pass addresses only when you were specifically instructed to do so or the
@@ -1867,7 +1875,7 @@ build profiles use 2.13.0.
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
 | `--exp-b12x` | Select the B12X profile. Pulls `eugr/spark-vllm-b12x:latest` unless a local wheel/image build is requested; defaults to local tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
-| `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with the same image ID are skipped. |
+| `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with matching image IDs or equivalent image content are skipped. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
 | `--copy-parallel` | Copy to all specified hosts concurrently. |
 | `-j, --build-jobs <jobs>` | Number of parallel build jobs (default: 16) |
@@ -1909,7 +1917,7 @@ The `launch-cluster.sh` script simplifies the process of starting the cluster no
 This will:
 1.  Auto-detect the active InfiniBand and Ethernet interfaces.
 2.  Auto-detect the node IP.
-3.  Verify that the selected Docker image has the same content-addressable image ID on the head and every worker.
+3.  Verify that the selected Docker image has matching IDs or equivalent image content on the head and every worker.
 4.  Launch idle containers on the head and worker nodes.
 5.  Use native no-Ray multiprocessing by default, or start Ray when `--ray` is selected.
 
@@ -1917,7 +1925,7 @@ Assumptions and limitations:
 
 - It assumes that you've already set up passwordless SSH access on all nodes. If not, follow NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks). I recommend setting up static IPs in the configuration instead of automatically assigning them every time, but this script should work with automatically assigned addresses too.
 - By default, it assumes that the container image name is `vllm-node`. If it differs, you need to specify it with `-t <name>` parameter.
-- Before launching a multi-node cluster, it compares `docker image inspect` IDs for the selected image on the head and every active worker. The launch is aborted if an image is missing or any ID differs.
+- Before launching a multi-node cluster, it compares `docker image inspect` IDs for the selected image on the head and every active worker. Differing IDs are accepted only when the platform, filesystem layers, and runtime configuration match. The launch is aborted if an image is missing or equivalence cannot be verified.
 - If both ConnectX **physical** ports are utilized, and both have IP addresses, it will use whatever interface it finds first. Use `--eth-if` to override.
 - It will ignore IPs associated with the 2nd "clone" of the physical interface. For instance, the outermost port on Spark has two logical Ethernet interfaces: `enp1s0f1np1` and `enP2p1s0f1np1`. Only `enp1s0f1np1` will be used. To override, use `--eth-if` parameter.
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
