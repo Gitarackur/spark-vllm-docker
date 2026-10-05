@@ -451,8 +451,9 @@ mpirun -np 3 -H spark1:1,spark2:1,spark3:1 \
 ## Closed rings of four or more Sparks
 
 A closed ring connects each Spark's two QSFP ports to two different neighbors.
-Keep all nodes on the management network and configure passwordless SSH with
-the existing configurator. Assign each link's addressed CX-7 interfaces their
+Keep all nodes on the management network and configure passwordless SSH similarly to other topologies. 
+
+Assign each link's addressed CX-7 interfaces their
 own subnet, as in the three-node mesh setup above. Discovery requires Python 3,
 `ibdev2netdev`, `ip`, and `ping` on every node.
 
@@ -669,7 +670,7 @@ one neighbor. When the resulting graph is a closed ring, it orders
 endpoints in the same `.env` file:
 
 ```bash
-./run-recipe.sh --discover --config .env-4x
+./run-recipe.sh --discover
 ```
 
 The only new field is `CLUSTER_LINKS`: a single-line JSON list of links, enclosed
@@ -719,16 +720,16 @@ scale linearly with the number of nodes.
 
 ```bash
 # Preview the four-node launch before setup
-./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --config .env-4x --tp 4 --dry-run
+./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --tp 4 --dry-run
 # Download/build as needed, distribute to all workers, and launch
-./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --config .env-4x --tp 4 --setup
+./run-recipe.sh recipes/qwen3.8-27b-nvfp4-dflash2.yaml --tp 4 --setup
 ```
 
 To distribute an existing image or a model separately:
 
 ```bash
-./build-and-copy.sh --config .env-4x --no-build -c --copy-parallel
-./hf-download.sh --config .env-4x org/model -c --copy-parallel
+./build-and-copy.sh --no-build -c --copy-parallel
+./hf-download.sh org/model -c --copy-parallel
 ```
 
 New ring configs omit `COPY_HOSTS`, so `-c` includes every worker. Explicit

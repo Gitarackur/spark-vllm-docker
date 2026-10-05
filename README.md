@@ -311,6 +311,14 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-10-04
+
+Spark-vllm-docker now supports switchless ring configurations with the number of nodes >3. 
+Tested with 4x switchless ring configuration, but should be able to support larger rings.
+
+Autodiscovery and container/model distribution handle ring setups as long as it's networking 
+is properly configured and passwordless SSH is set up as outlined in the [Networking Guide](docs/NETWORKING.md#example-four-node-ring).
+
 ### 2026-10-02
 
 `hf-download.sh` now supports model cache management locally and across the
