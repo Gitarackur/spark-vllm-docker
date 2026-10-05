@@ -249,7 +249,7 @@ prepare_local_vllm_source() {
 get_remote_image_id() {
     local host="$1"
     local image="$2"
-    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+    cluster_copy_ssh "$host" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
 }
 
 copy_to_host() {
@@ -257,7 +257,7 @@ copy_to_host() {
     echo "Loading image into ${SSH_USER}@${host}..."
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
-    if cat "$TMP_IMAGE" | ssh "${SSH_USER}@${host}" "docker load"; then
+    if cluster_copy_ssh "$host" "docker load" < "$TMP_IMAGE"; then
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -921,6 +921,9 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
         echo "Using COPY_HOSTS from .env: $DOTENV_COPY_HOSTS"
         IFS=',' read -ra HOSTS_FROM_ENV <<< "$DOTENV_COPY_HOSTS"
         COPY_HOSTS=("${HOSTS_FROM_ENV[@]}")
+    elif [[ -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+        IFS=',' read -ra COPY_HOSTS <<< "${DOTENV_CLUSTER_NODES#*,}"
+        [[ "$DOTENV_CLUSTER_NODES" == *,* ]] || COPY_HOSTS=()
     else
         echo "No hosts specified. Using autodiscovery..."
         detect_interfaces || { echo "Error: Interface detection failed."; exit 1; }
@@ -938,6 +941,10 @@ if [ "$COPY_TO_FLAG" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
         fi
         echo "Autodiscovered hosts: ${COPY_HOSTS[*]}"
     fi
+fi
+
+if [[ "$COPY_TO_FLAG" == true && -n "${DOTENV_CLUSTER_LINKS:-}" ]]; then
+    python3 "$SCRIPT_DIR/cluster_topology.py" check || exit 1
 fi
 
 # Validate flag combinations

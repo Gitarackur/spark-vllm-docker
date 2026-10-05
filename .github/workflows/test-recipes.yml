@@ -7,6 +7,9 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'build-and-copy.sh'
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
@@ -19,6 +22,9 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'build-and-copy.sh'
       - 'hf-download.sh'
       - 'hf-cache.py'
       - 'recipes/**'
@@ -61,6 +67,9 @@ jobs:
 
     - name: Test Hugging Face cache ownership repair
       run: python3 tests/test_hf_download_permissions.py
+
+    - name: Test ring discovery and routed distribution
+      run: python3 tests/test_cluster_topology.py
 
     - name: Test Hugging Face cache management and copies
       run: |

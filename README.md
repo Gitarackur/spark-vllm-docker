@@ -2,7 +2,7 @@
 # vLLM Docker Optimized for DGX Spark (single or multi-node)
 
 This repository contains the Docker configuration and startup scripts to run vLLM on DGX Spark, from a single node to multi-node clusters using Ray or vLLM's native PyTorch distributed mode. It supports InfiniBand/RDMA (NCCL), custom environment configuration, and high-performance model loading through fastsafetensors and InstantTensor.
-Cluster setup supports direct connections between dual Sparks, QSFP/RoCE switch configurations, and 3-node mesh configurations.
+Cluster setup supports direct connections between dual Sparks, QSFP/RoCE switch configurations, 3-node mesh configurations, and [closed rings](docs/NETWORKING.md#closed-rings-of-four-or-more-sparks).
 
 While it was primarily developed to support multi-node inference, it works just as well on single-node setups.
 

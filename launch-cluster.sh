@@ -281,11 +281,11 @@ if [[ -f "$CONFIG_FILE" ]]; then
     echo "Loading configuration from .env file..."
     
     # Validate .env file syntax
-    if ! python3 -c "
+    if ! python3 - "$CONFIG_FILE" <<'PYENV'
 import sys
 import re
 
-env_file = '$CONFIG_FILE'
+env_file = sys.argv[1]
 seen_keys = set()
 
 with open(env_file, 'r') as f:
@@ -315,7 +315,8 @@ with open(env_file, 'r') as f:
         seen_keys.add(key)
 
 sys.exit(0)
-" 2>/dev/null; then
+PYENV
+    then
         echo "Error: Invalid .env file syntax. Aborting."
         exit 1
     fi
@@ -332,19 +333,16 @@ sys.exit(0)
         # Skip if key is empty after trimming
         [[ -z "$key" ]] && continue
         
-        # Remove quotes and whitespace from value using Python for proper shlex handling
-        value=$(python3 -c "
-import shlex
+        # Pass data as an argument, not Python source (JSON uses both quote types).
+        value=$(python3 - "$value" <<'PYENV'
 import sys
-value = '''$value'''
-# Strip whitespace
-value = value.strip()
-# Remove surrounding quotes if present
-if (value.startswith('\"') and value.endswith('\"')) or (value.startswith(\"'\" ) and value.endswith(\"'\")):
+value = sys.argv[1].strip()
+if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
     value = value[1:-1]
 print(value)
-")
-        
+PYENV
+        ) || exit 1
+
         # Export with DOTENV_ prefix
         export "DOTENV_$key=$value"
     done < "$CONFIG_FILE"
@@ -431,7 +429,7 @@ for env_var in $(compgen -v DOTENV_CONTAINER_); do
     actual_var="${env_var#DOTENV_CONTAINER_}"
     
     # Properly escape the value for shell using Python
-    escaped_value=$(python3 -c "import shlex; print(shlex.quote('$value'))")
+    escaped_value=$(python3 -c 'import shlex, sys; print(shlex.quote(sys.argv[1]))' "$value")
     
     # Add to docker args
     DOCKER_ARGS="$DOCKER_ARGS -e $actual_var=$escaped_value"
@@ -640,6 +638,21 @@ fi
 if [[ ${#PORT_MAPPINGS[@]} -gt 0 && "$SOLO_MODE" != "true" ]]; then
     echo "Error: -p/--publish port forwarding is only supported in solo mode. Use --solo or remove port mappings for cluster mode."
     exit 1
+fi
+
+# Validate saved topology before installing cleanup traps or touching containers.
+# Account for the launcher trimming ranks to the command's parallelism sizes.
+if [[ "$SOLO_MODE" != true && -n "${DOTENV_CLUSTER_LINKS:-}" && "$ACTION" != stop && "$ACTION" != status ]]; then
+    topology_command="$COMMAND_TO_RUN"
+    if [[ "$LAUNCH_SCRIPT_MODE" == true ]]; then
+        topology_command=$(cat "$LAUNCH_SCRIPT_PATH") || exit 1
+    fi
+    topology_options=()
+    [[ "$NO_RAY_MODE" == true ]] || topology_options+=(--ray)
+    topology_nodes=$(IFS=,; echo "$HEAD_IP${PEER_NODES[*]:+,${PEER_NODES[*]}}")
+    topology_env=$(TOPOLOGY_DOCKER_ARGS="$DOCKER_ARGS" python3 "$SCRIPT_DIR/cluster_topology.py" validate \
+        --nodes "$topology_nodes" --command "$topology_command" "${topology_options[@]}") || exit 1
+    DOCKER_ARGS="$DOCKER_ARGS $topology_env"
 fi
 
 echo "Head Node: $HEAD_IP"
