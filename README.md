@@ -2,7 +2,7 @@
 # vLLM Docker Optimized for DGX Spark (single or multi-node)
 
 This repository contains the Docker configuration and startup scripts to run vLLM on DGX Spark, from a single node to multi-node clusters using Ray or vLLM's native PyTorch distributed mode. It supports InfiniBand/RDMA (NCCL), custom environment configuration, and high-performance model loading through fastsafetensors and InstantTensor.
-Cluster setup supports direct connections between dual Sparks, QSFP/RoCE switch configurations, and 3-node mesh configurations.
+Cluster setup supports direct connections between dual Sparks, QSFP/RoCE switch configurations, 3-node mesh configurations, and [closed rings](docs/NETWORKING.md#closed-rings-of-four-or-more-sparks).
 
 While it was primarily developed to support multi-node inference, it works just as well on single-node setups.
 
@@ -48,20 +48,31 @@ WSL, vLLM keeps CUDA's reported free memory instead of replacing it with guest
 RAM availability. Native Linux UMA accounting and proactive allocator-cache
 release keep their upstream behavior.
 
-Source builds also trim unused glibc CPU heap pages after startup garbage
-collection in API servers and workers. This complements the existing CUDA
-allocator cleanup before KV cache sizing/allocation. The CPU trim is included
-in exported vLLM wheels and runs after warmup; platforms without `malloc_trim`
-skip it.
+Regular and B12X source builds also trim unused glibc CPU heap pages before
+the final KV cache sizing measurement, after profiling cleanup. On Spark's
+shared CPU/GPU memory, this prevents freed loader/profiling buffers retained
+by glibc from reducing the KV budget. API servers and workers still trim after
+startup garbage collection and warmup. Both trims are included in exported
+vLLM wheels; platforms without `malloc_trim` skip them.
 
 Runtime images also set `VLLM_WSL2_ENABLE_PIN_MEMORY=1` by default. Pass
 `-e VLLM_WSL2_ENABLE_PIN_MEMORY=0` to `launch-cluster.sh` or `docker run` to opt
 out.
 
-B12X autotuning is disabled by default with `B12X_AUTOTUNE=0` on all GPU
-architectures. Pass `-e B12X_AUTOTUNE=1` to enable it for a launch.
+Regular and B12X source builds include a targeted patch based on
+[vLLM PR #58028](https://github.com/vllm-project/vllm/pull/58028). When `--api-key`
+is configured, the Python frontend requires authentication for every route
+except `/health`, `/ping`, `/load`, and `/version`; CORS preflight requests also
+remain exempt. This includes protecting `/metrics`, `/tokenize`, and the API
+docs. The patch is included in exported vLLM wheels and leaves the Rust
+frontend unchanged.
+
 
 ## QUICK START (USING RECIPES)
+
+Recipe launches check that the model declared in the recipe is in the local
+Hugging Face cache. If it is missing, the runner stops and asks you to rerun
+the same command with `--setup`. Dry runs do not require downloaded models.
 
 ### Single Spark
 
@@ -77,6 +88,14 @@ cd spark-vllm-docker
 ### Dual Sparks (or more)
 
 Before you start, make sure you connect your Sparks together and enable passwordless SSH as described in our [Networking Guide](docs/NETWORKING.md). You can also check out NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks), but using our guide is the best way to get started. The guide includes instructions for 3-node Spark mesh clusters.
+
+The [experimental cluster setup helper](docs/NETWORKING.md#automated-cluster-setup) can configure
+CX7 networking and mutual passwordless SSH from the head node using the nodes'
+management IP addresses. It supports direct connections, switches, and closed
+rings, saves the head's launch `.env` after verification, and includes dry-run
+and restore modes. Use `--mtu BYTES` to override the default CX7 MTU of `9000`.
+It also adds Docker group membership on every node;
+`--doctor` checks and repairs an existing saved setup.
 
 Check out locally. Do it on the head node of the cluster.
 This will build the image, download and distribute the model and launch the cluster.
@@ -127,7 +146,7 @@ Launch the server:
     --port 8000 \
     --trust-remote-code \
     --kv-cache-dtype fp8 \
-    --gpu-memory-utilization 0.7 \
+    --gpu-memory-utilization 0.8 \
     --max-model-len 262144 \
     --max-num-seqs 8 \
     --max-num-batched-tokens 16384 \
@@ -142,17 +161,18 @@ Launch the server:
     --tensor-parallel-size 1
 ```
 
-### Single Spark: Qwen3.8 Flash Next NVFP4
+### Single Spark: Qwen3.8 Flash Next FP4 Local
 
 This matches the [solo Qwen3.8 Flash Next recipe](recipes/qwen3.8-flash-next-nvfp4-solo.yaml),
-including PLE tables offloaded to disk and speculative decoding.
+using `nvidia/Qwen3.8-Flash-Next-FP4-Local`, with PLE tables offloaded to disk
+through `io_uring` and speculative decoding.
 It uses the B12X model loader and a maximum context length of 262144 tokens.
 
 Pull the tested B12X image and download the model:
 
 ```bash
 ./build-and-copy.sh --exp-b12x
-./hf-download.sh local-inference-lab/Qwen3.8-Flash-Next-NVFP4
+./hf-download.sh nvidia/Qwen3.8-Flash-Next-FP4-Local
 ```
 
 Launch the server:
@@ -160,6 +180,7 @@ Launch the server:
 ```bash
 ./launch-cluster.sh --solo -t vllm-node-b12x \
   -e VLLM_PLE_TABLE_MEMORY=disk \
+  -e B12X_DISK_BACKEND=io_uring \
   -e CUTE_DSL_ARCH=sm_121a \
   -e SAFETENSORS_FAST_GPU=1 \
   -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
@@ -168,10 +189,13 @@ Launch the server:
   -e VLLM_USE_MEGA_AOT_ARTIFACT=1 \
   -e VLLM_USE_V2_MODEL_RUNNER=1 \
   -e B12X_POLICY_MODE=auto \
-  exec vllm serve local-inference-lab/Qwen3.8-Flash-Next-NVFP4 \
+  -e VLLM_MXFP8_LM_HEAD=1 \
+  -e VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE=w13 \
+  -e VLLM_B12X_MOE_FP4_FORCE_A16=1 \
+  -e B12X_W4A16_A4_PREFILL=1 \
+  exec vllm serve nvidia/Qwen3.8-Flash-Next-FP4-Local \
     --host 0.0.0.0 \
     --port 8000 \
-    --trust-remote-code \
     --tensor-parallel-size 1 \
     --pipeline-parallel-size 1 \
     --mamba-cache-mode align \
@@ -304,6 +328,100 @@ container's low-memory monitor. See [Launching the Cluster](#2-launching-the-clu
 for additional launcher options.
 
 ## CHANGELOG
+
+### 2026-10-16
+
+'glm-5.3-flash` recipe now uses a new FP4-Local checkpoint from NVIDIA, replacing an older version hosted in local-inference-lab repository. As with Qwen, this checkpoint features compressed scales and is QAD quantized. Up to 2M KV cache on dual Sparks!
+
+### 2026-10-15
+
+#### Qwen 3.8 Flash Next recipes updated
+
+The `qwen3.8-flash-next-nvfp4-solo` and `qwen3.8-flash-next-nvfp4-cluster`recipes now use a new checkpoint from NVIDIA replacing older version hosted in local-inference-lab repository. This checkpoint brings new Compressed Scales and is quantized using QAD method.
+
+The result is better quality and smaller size => more KV cache!
+
+#### New Nemotron 3.5 model family support
+
+Added two recipes for a single DGX Spark:
+
+- [Nemotron 3.5 Super VL 120B-A12B NVFP4](recipes/nemotron-3.5-super-vl-nvfp4.yaml),
+  with image and video input support.
+- [Nemotron 3.5 Bolt 74B-A9B-24GB](recipes/nemotron-3.5-bolt-24gb.yaml).
+
+Run either recipe with:
+
+```bash
+# Super VL
+./run-recipe.sh nemotron-3.5-super-vl-nvfp4 --solo --setup
+
+# Bolt 24GB
+./run-recipe.sh nemotron-3.5-bolt-24gb --solo --setup
+```
+
+### 2026-10-07
+
+B12X is now part of Flashinfer! `--exp-b12x` builds now build Flashinfer from  [`local-inference-lab/flashinfer@main`](https://github.com/local-inference-lab/flashinfer/tree/main),
+with separate wheel caches and no `flashinfer-cubin` wheel. Regular builds
+continue to use upstream FlashInfer. Both lanes now rely on FlashInfer for
+B12X instead of installing the standalone `b12x` package.
+
+### 2026-10-05
+
+#### Deepseek V4.1 Flash recipes for 3x and 4x Sparks
+
+Added new recipes for Deepseek V4.1 Flash for 3x and 4x Sparks (with or without switch). Both use tensor parallelism and give you similar performance (~73 t/s speedbench coding).
+
+To run on 3-node mesh/ring:
+
+```bash
+./run-recipe.sh recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml --setup
+```
+
+To run on a 4-node cluster (switch or ring):
+
+```bash
+./run-recipe.sh recipes/4x-spark-cluster/deepseek-v4.1-flash.yaml --setup
+```
+
+#### Switchless ring support
+
+Spark-vllm-docker now supports switchless ring configurations with the number of nodes >3. 
+Tested with 4x ring, but should work with larger rings as well (will test when get access to one).
+
+Autodiscovery and container/model distribution handle ring setups as long as it's networking 
+is properly configured and passwordless SSH is set up as outlined in the 
+[Networking Guide](docs/NETWORKING.md#example-four-node-ring).
+
+**No change in the recipes is needed!**
+
+Ring setup has one limitation compared to switch-based setups - you can either use full ring capacity, solo, or 2 nodes. Nodes participating in inference need to either be directly connected or form a complete ring. Open-ended configurations will not work (e.g. 3 node inference in 4 node ring).
+
+### 2026-10-02
+
+`hf-download.sh` now supports model cache management locally and across the
+cluster: list models and revisions with `--list`, remove selected models with
+`--delete`, and reclaim space from unreferenced revisions with `--cleanup`.
+Add `-c` to extend these operations to all selected cluster nodes. It also
+enables cluster distribution for downloads and restores, and extends deletion
+after backup (`--backup --delete`) to peer nodes. Backups and backup listings
+use the head node's directory.
+
+Listings include model sizes and node locations, with sorting and console,
+CSV, JSON, or Markdown output. Use `--backup` with `--backup-dir` to save models
+to a mounted directory on the head node, `--list-backup` to inspect backups,
+and `--restore` to restore and optionally distribute them with `-c` and
+`--copy-parallel`. Backup and deletion accept `--revision` to select a cached
+commit by hash, unique prefix, branch, or tag. `--backup --delete` removes cached
+copies only after a successful backup and coverage checks. Deletion and cleanup
+ask for confirmation unless `--force` is supplied, and missing `uvx`
+installations are now handled automatically on the head and peer nodes.
+Backups automatically use regular snapshot files on external drives without
+symlink support, with the same listing, restore, and revision selection commands.
+
+### 2026-09-30
+
+`./hf-download.sh` will now try to check and automatically repair cache permissions before downloading or distributing the model across the nodes.
 
 ### 2026-09-23
 
@@ -1609,6 +1727,13 @@ Building the container manually is no longer supported due to Dockerfile complex
 
 The `build-and-copy.sh` script prepares the runner image and optionally copies it to one or more nodes. By default it pulls `eugr/spark-vllm:latest` and tags it locally. Use `--use-wheels` to build only the runner from downloaded or local precompiled wheels. Source compilation happens only when an explicit source-build flag such as `--rebuild-vllm`, `--vllm-ref`, `--apply-vllm-pr`, `--rebuild-flashinfer`, `--flashinfer-ref`, or `--apply-flashinfer-pr` is supplied.
 
+Source builds select DeepGEMM after applying vLLM patches. vLLM refs that require
+the stable-ABI `deep_gemm/_C.py` interface use the repository and commit declared
+in that ref's CMake configuration. Older refs, including the current B12X fork,
+retain the pinned DeepGEMM SM121 workaround. The build checks required source
+files before compiling and records the selected commit in `.deepgemm-commit`
+alongside the exported wheels.
+
 **Basic usage (prepare local image):**
 
 ```bash
@@ -1639,6 +1764,14 @@ nodes in the cluster and excludes the current node.
 `-c` / `--copy-to` requests distribution. With no addresses, the script uses
 `COPY_HOSTS` from `.env` or autodiscovery; `--copy-parallel` transfers to all
 resolved hosts concurrently.
+
+Hosts with matching image IDs are skipped. If IDs differ, the scripts compare
+the image's platform, ordered filesystem layer hashes, and runtime configuration.
+This recognizes equivalent images across classic Docker and containerd image
+stores, including locally built or saved/loaded images without registry digests.
+The same check runs before cluster launch. It requires Python 3 on the head
+only; workers need Docker. If content cannot be verified, distribution copies
+the image and cluster launch rejects differing IDs.
 
 **Manual host fallback:**
 
@@ -1729,12 +1862,18 @@ For the maintained experimental B12X combination, the equivalent shortcut is:
 
 Without local-build flags, this pulls `eugr/spark-vllm-b12x:latest` and tags it
 as `vllm-node-b12x` unless `-t` is supplied. To build the maintained combination
-from `local-inference-lab/vllm@dev/jovian-judgement` and the `master` branch of the
-B12X repository, run:
+from `local-inference-lab/vllm@dev/karmic-kraken` and
+`local-inference-lab/flashinfer@main`, run:
 
 ```bash
 ./build-and-copy.sh --exp-b12x --rebuild-vllm
 ```
+
+This builds the fork's FlashInfer wheels when its cache is missing or incomplete.
+Add `--rebuild-flashinfer` to refresh an existing cached set. B12X builds omit
+the `flashinfer-cubin` wheel and retain the Python, JIT-cache, and required
+JIT provider wheels. They never download regular FlashInfer wheels;
+`--force-flashinfer-download` is unsupported for this lane.
 
 It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves selected Blackwell subarchitectures in vLLM's CUDA 13
@@ -1765,8 +1904,10 @@ Wheel profiles are selected automatically:
 ```text
 .wheel-cache/
 ├── flashinfer/
-│   ├── regular/   # shared by regular and B12X builds
-│   └── custom/    # custom ref/PR or non-default GPU target
+│   ├── regular/       # upstream FlashInfer
+│   ├── custom/        # upstream with a custom ref/PR or GPU target
+│   ├── b12x/          # local-inference-lab FlashInfer, without cubins
+│   └── b12x-custom/   # fork with a custom ref/PR or GPU target
 └── vllm/
     ├── regular/
     ├── b12x/
@@ -1782,19 +1923,16 @@ at `/workspace/vllm/structured_server.py` in the container when the selected
 vLLM source includes it. The script travels with locally exported wheels;
 older source refs and downloaded wheel sets without it skip this copy.
 
-Regular `vllm-project/vllm` runner builds install the latest `b12x` release from
-PyPI, including builds using precompiled vLLM wheels. A per-build cache key and
-package-index refresh prevent stale B12X releases from being reused. The
-`--no-deps` install preserves the image's Torch and CUTLASS DSL versions.
-
 The `--exp-b12x` profile and any branch, tag, or commit selected from
-`local-inference-lab/vllm` continue to clone the `master` ref of
-`https://github.com/lukealonso/b12x.git` and install its `b12x` distribution.
-A per-build cache key prevents Docker from reusing a stale source checkout.
-Before the `--no-deps` install, its package metadata is updated to the image-wide
-CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at
-`/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; both current
-build profiles use 2.13.0.
+`local-inference-lab/vllm` use the FlashInfer fork. Regular builds keep the
+original `flashinfer-ai/flashinfer` source and published wheel release.
+`--flashinfer-ref` and `--apply-flashinfer-pr` apply to the selected FlashInfer
+repository. Source checkout caches are isolated by repository as well.
+
+Neither lane installs the standalone `b12x` package from PyPI or Git. B12X is
+part of FlashInfer, including the compatibility imports and cache-integrity
+fix in the fork. Build metadata records the FlashInfer repository, ref, and
+commit. Both current build profiles use PyTorch 2.13.0.
 
 **Copy existing image without rebuilding:**
 
@@ -1811,7 +1949,7 @@ build profiles use 2.13.0.
 | `--gpu-arch <arch>` | Target GPU architecture for wheel/source builds. Non-default targets rebuild FlashInfer unless the local cache is marked for that architecture. The default `12.1a` still uses the prebuilt image unless another build-forcing flag is set. |
 | `--rebuild-flashinfer` | Skip prebuilt wheel download; force a fresh local FlashInfer build |
 | `--rebuild-vllm` | Force rebuild vLLM from source |
-| `--force-flashinfer-download` | Force download FlashInfer wheels, skipping cached wheel checks |
+| `--force-flashinfer-download` | Force download upstream FlashInfer wheels, skipping cached wheel checks; unsupported for B12X |
 | `--force-vllm-download` | Force download vLLM wheels, skipping cached wheel checks |
 | `--force-download` | Force download all prebuilt wheels, skipping cached wheel checks |
 | `--vllm-repo <url>` | vLLM Git repository. Defaults to `https://github.com/vllm-project/vllm.git`; custom repositories bypass the shared checkout cache and force a source build. |
@@ -1823,11 +1961,11 @@ build profiles use 2.13.0.
 | `--flashinfer-ref <ref>` | FlashInfer commit SHA, branch or tag (default: `main`) |
 | `--apply-vllm-pr <pr-or-url>` | Apply a vLLM PR patch during the image build. Numbers select `vllm-project/vllm`; full `https://github.com/OWNER/REPO/pull/NUMBER` URLs select another public GitHub repository. Repeatable. This is distinct from the launch-time option accepted by `launch-cluster.sh` and `run-recipe.sh`. |
 | `--apply-preset-vllm-prs` | Apply preset vLLM PRs even when `--vllm-repo`, `--vllm-ref`, or `--apply-vllm-pr` would otherwise suppress them |
-| `--apply-flashinfer-pr <pr-num>` | Apply a FlashInfer PR patch during build. Can be specified multiple times. |
+| `--apply-flashinfer-pr <pr-num>` | Apply a PR from the selected FlashInfer repository during build. Can be specified multiple times. |
 | `--tf5` | Deprecated compatibility flag; pulls/tags the prebuilt image as `vllm-node-tf5` unless another build-forcing flag is set. Aliases: `--pre-tf, --pre-transformers`. |
 | `--exp-mxfp4` | Build with experimental native MXFP4 support. Alias: `--experimental-mxfp4`. |
 | `--exp-b12x` | Select the B12X profile. Pulls `eugr/spark-vllm-b12x:latest` unless a local wheel/image build is requested; defaults to local tag `vllm-node-b12x`. Alias: `--experimental-b12x`. |
-| `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with the same image ID are skipped. |
+| `-c, --copy-to <hosts>` | Host(s) to copy the image to after preparation (space- or comma-separated). Hosts with matching image IDs or equivalent image content are skipped. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
 | `--copy-parallel` | Copy to all specified hosts concurrently. |
 | `-j, --build-jobs <jobs>` | Number of parallel build jobs (default: 16) |
@@ -1869,7 +2007,7 @@ The `launch-cluster.sh` script simplifies the process of starting the cluster no
 This will:
 1.  Auto-detect the active InfiniBand and Ethernet interfaces.
 2.  Auto-detect the node IP.
-3.  Verify that the selected Docker image has the same content-addressable image ID on the head and every worker.
+3.  Verify that the selected Docker image has matching IDs or equivalent image content on the head and every worker.
 4.  Launch idle containers on the head and worker nodes.
 5.  Use native no-Ray multiprocessing by default, or start Ray when `--ray` is selected.
 
@@ -1877,14 +2015,14 @@ Assumptions and limitations:
 
 - It assumes that you've already set up passwordless SSH access on all nodes. If not, follow NVIDIA's [Connect Two Sparks Playbook](https://build.nvidia.com/spark/connect-two-sparks/stacked-sparks). I recommend setting up static IPs in the configuration instead of automatically assigning them every time, but this script should work with automatically assigned addresses too.
 - By default, it assumes that the container image name is `vllm-node`. If it differs, you need to specify it with `-t <name>` parameter.
-- Before launching a multi-node cluster, it compares `docker image inspect` IDs for the selected image on the head and every active worker. The launch is aborted if an image is missing or any ID differs.
+- Before launching a multi-node cluster, it compares `docker image inspect` IDs for the selected image on the head and every active worker. Differing IDs are accepted only when the platform, filesystem layers, and runtime configuration match. The launch is aborted if an image is missing or equivalence cannot be verified.
 - If both ConnectX **physical** ports are utilized, and both have IP addresses, it will use whatever interface it finds first. Use `--eth-if` to override.
 - It will ignore IPs associated with the 2nd "clone" of the physical interface. For instance, the outermost port on Spark has two logical Ethernet interfaces: `enp1s0f1np1` and `enP2p1s0f1np1`. Only `enp1s0f1np1` will be used. To override, use `--eth-if` parameter.
 - It assumes that the same physical interfaces are named the same on all nodes (IOW, enp1s0f1np1 refers to the same physical port on all nodes). If it's not the case, you will have to launch cluster nodes manually or modify the script.
 - It clears the Docker image entrypoint by default so images that define an entrypoint, such as `vllm-openai`, can still start as idle cluster containers before commands are executed. Use `--keep-entrypoint` to keep the image entrypoint.
 - Solo mode uses loopback for internal vLLM, NCCL, Gloo, and TensorPipe communication and disables NCCL RDMA, even when `.env` contains cluster interfaces or a cluster IP. This also applies when a single-node configuration automatically selects solo mode. Explicit `--eth-if` and container environment settings (`-e` or `CONTAINER_*`) can override these defaults. The API listening address is still controlled by `vllm serve --host`.
 - In solo mode, `-p` / `--publish` can be used to publish ports in Docker format, for example `-p 8000:8000`. When port publishing is used, the launcher does not use host networking. Port publishing is not supported in cluster mode.
-- It sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in each container by default to reduce allocator fragmentation on DGX Spark. Override it with `-e PYTORCH_CUDA_ALLOC_CONF=<value>` when needed.
+- It leaves `PYTORCH_CUDA_ALLOC_CONF` unset by default. PyTorch defaults to `expandable_segments:False` while retaining normal memory caching. Opt in for workloads that benefit with `-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, or set `PYTORCH_CUDA_ALLOC_CONF` in the recipe's `env` section.
 - It mounts `~/.cache/huggingface`, `~/.cache/vllm`, `~/.cache/flashinfer`, `~/.cache/b12x`, `~/.triton`, and `~/.tilelang` by default. Use `--no-cache-dirs` to skip the vLLM/FlashInfer/B12X/Triton/TileLang cache mounts. Add other mounts with repeatable Docker-style `-v` / `--volume` options, e.g. `-v "$HOME/my-data:/data"`.
 
 
@@ -2103,6 +2241,8 @@ When `--non-privileged` is specified:
 - Resource limits are applied: memory (110GB), memory+swap (120GB), pids (4096)
 
 All launch modes set Docker's open-file ulimit to `1048576`, which avoids loader failures when highly sharded models are opened in parallel by Ray workers. Override it with `VLLM_SPARK_NOFILE_LIMIT` if your host requires a different value.
+
+All launch modes also set `--ulimit memlock=-1:-1` on head and worker containers so NCCL/RDMA memory registration is not constrained by Docker's locked-memory limits. This does not increase the amount of available RAM or change container memory limits.
 
 These resource limits can be customized:
 ```bash
@@ -2428,6 +2568,11 @@ the existing CUDA-based accounting under WSL. InstantTensor's budget fraction
 (`INSTANTTENSOR_MAX_FREE_MEM_USAGE`, default `0.5`), minimum across distributed
 ranks, and buffer-size checks still apply.
 
+InstantTensor 0.2.1 includes native Linux UMA accounting, but does not exclude
+WSL from that path. The patch remains necessary for the WSL policy and supports
+both 0.2.0 and 0.2.1, preserving 0.2.1's budget validation and error handling
+across distributed ranks.
+
 These runners also default to `INSTANTTENSOR_IO_DEPTH=16` to reduce GPU and
 pinned host staging-buffer usage. Override it through a recipe's `env` settings
 or `-e INSTANTTENSOR_IO_DEPTH=<depth>` with `launch-cluster.sh` or `docker run`.
@@ -2438,12 +2583,23 @@ I recommend using [llama-benchy](https://github.com/eugr/llama-benchy) - a new b
 
 ## 10\. Downloading Models
 
-The `hf-download.sh` script provides a convenient way to download models from HuggingFace and distribute them across your cluster nodes. It uses Huggingface CLI via `uvx` for fast downloads and `rsync` for distribution across the cluster.
+The `hf-download.sh` script downloads, lists, removes, backs up, and restores
+Hugging Face models locally or across the cluster. It uses the Hugging Face CLI
+via `uvx` and `rsync` for model transfers.
 
 ### Prerequisites
 
-- `uvx` must be installed (the script will prompt you to install it if missing).
-- Passwordless SSH access to other nodes (if copying).
+- The script checks for `uvx` on the head and affected peers, including
+  `~/.local/bin` and `~/.cargo/bin` when they are absent from SSH's `PATH`.
+  If missing, it installs uv (which includes `uvx`) into the current user's
+  `~/.local/bin` using the [official installer](https://docs.astral.sh/uv/getting-started/installation/).
+  This needs internet access and `curl` or `wget` on that node. Installation
+  does not use sudo or modify shell profiles; setup messages go to stderr.
+- Python 3.10+ is used for cache paths, inventory, and backup management.
+- `rsync` 3.2.3+ is required for distribution; local backups and restores also use `rsync`.
+- Passwordless SSH access to other nodes (with `-c`). Listing, deletion, and
+  cleanup require Python on each node; `uvx` is prepared automatically. Use a recent Hugging Face CLI
+  that supports `hf cache ls --revisions --format json --sort` and `hf cache rm`.
 
 ### Usage
 
@@ -2473,16 +2629,25 @@ The `hf-download.sh` script provides a convenient way to download models from Hu
 
 When `-c` is given without explicit hosts, the script checks `COPY_HOSTS` in `.env` first, then falls back to autodiscovery. In mesh mode this means transfers go over the direct IB-attached interfaces automatically.
 
-If distribution fails with permission errors under `~/.cache`, verify ownership
-on every node. When root-owned cache files are the cause and the cache should
-belong to the login user, run this locally on each node:
+Before downloading, the script checks for cache entries owned by another user
+(for example, root-owned files created by vLLM). If needed, it first tries an
+existing `vllm-node` image, then `vllm-node-b12x`, using the local system Docker
+daemon. It runs a temporary container with only the affected cache directory
+mounted and `chown` as its entrypoint, setting ownership to the host user's
+numeric UID. No images are pulled. If Docker is unavailable or cannot repair
+ownership, it falls back to `sudo chown -R` for the current login user.
+It checks `HF_HOME` (default: `~/.cache/huggingface`, or
+`$XDG_CACHE_HOME/huggingface`) and the Hub cache selected by `HF_HUB_CACHE`,
+then the legacy `HUGGINGFACE_HUB_CACHE`, then `$HF_HOME/hub`.
+These follow [Hugging Face's cache environment variables](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables).
 
-```bash
-sudo chown -R "$USER" "$HOME/.cache"
-```
-
-This is a privileged recursive change; confirm the target and ownership problem
-before running it. If `HF_HOME` points elsewhere, repair that cache path instead.
+With `-c`, it also checks and repairs those same absolute cache paths on every
+destination node, using the SSH login user as owner. Sudo may prompt for a
+password on nodes where Docker repair does not succeed. These checks run
+serially before any transfers, including with `--copy-parallel`. Without an
+interactive terminal, repairs require working Docker access or passwordless
+sudo. Ownership is verified after repair; if it remains incorrect, the script
+stops with an error.
 
 **Manual host fallback:**
 
@@ -2499,14 +2664,150 @@ the topology:
 ./hf-download.sh --config /path/to/cluster.env -c QuantTrio/MiniMax-M2-AWQ
 ```
 
+### Cache management
+
+**List models locally or across the cluster:**
+
+```bash
+./hf-download.sh --list
+./hf-download.sh --list -c
+./hf-download.sh --list -c --format json --sort name
+./hf-download.sh --list -c --format csv > models.csv
+./hf-download.sh --list -c --format md
+```
+
+Each revision appears separately, including models found only on peers. With
+`-c`, the nodes column identifies every node holding that revision. Size is in
+decimal GB (1 GB = 1,000,000,000 bytes), counting each blob once per revision.
+For a revision present on multiple nodes, the size shown is the largest cached
+copy, rather than the sum across nodes; partial downloads can differ by node.
+Revisions may share blobs, so summing rows is not total physical disk usage.
+
+`--format` accepts `console` (default), `csv`, `json`, or `md`. JSON and CSV
+include `model`, `revision`, and `size_gb`; cluster listings also include `nodes`
+(a JSON array or semicolon-separated CSV field). Diagnostics go to stderr.
+`--sort` is passed to `uvx hf cache ls` on each node, then applied to the combined
+inventory. It accepts `size`, `name`, `accessed`, or `modified`, optionally
+followed by `:asc` or `:desc`. The default is `size:desc`. For time sorting,
+the most recent timestamp across copies is used.
+
+**Delete a model, including all cached revisions:**
+
+```bash
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ -c
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ -c --force
+# Delete only one cached revision (use the hash printed by --list):
+./hf-download.sh --delete QuantTrio/MiniMax-M2-AWQ --revision COMMIT_HASH -c
+```
+
+Deletion asks once for confirmation covering the local node and selected peers.
+`--force` skips that prompt. An unavailable node aborts the inventory step
+before deletion starts; failures during deletion return a nonzero status.
+
+`--revision` selects one cached commit, retaining the model's other revisions
+and any blobs they still use. It accepts a full commit hash, a unique hash
+prefix of at least seven characters, or a cached branch/tag such as `main`.
+The selector is resolved across the selected nodes before confirmation; an
+unknown or ambiguous selector fails without deleting anything. If `main`
+points to different commits on different nodes, specify a commit hash instead.
+Nodes without the resolved commit are skipped. Revision deletion is refused
+if that hash also belongs to another cached repository on an affected node,
+because Hugging Face's hash-based removal can affect other repositories.
+
+**Back up to an existing directory on a mounted drive on the head node:**
+
+```bash
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models --delete -c
+# Back up just the revision currently referenced by main on the head:
+./hf-download.sh --backup QuantTrio/MiniMax-M2-AWQ --revision main --backup-dir /mnt/ssd/models
+```
+
+Backup copies all revisions available on the head into
+`<backup-dir>/models--<org>--<model>`. On filesystems supporting symlinks, it
+preserves snapshot links and copies any shared Hub blobs into the backup.
+The script tests the destination's symlink support before copying. On external
+drives that cannot create symlinks, it saves regular files inside each snapshot
+and omits the separate blob directory to avoid storing the same weights twice.
+This fallback also skips Unix ownership and permission preservation. Revisions
+that share weights can require more space because each snapshot has its own
+files. Both layouts are self-contained and work with `--list-backup`,
+`--restore`, and `--backup --delete`. The same fallback applies to backups
+selected with `--revision`.
+A backup is published only after the copy succeeds and its files, links, and
+refs validate. Existing backups are preserved;
+choose a different backup directory to make another backup of the same model.
+The backup directory must be outside the Hub cache, and must already exist.
+
+With `--revision`, backup includes only the selected head-node snapshot, its
+required blobs, and refs/metadata for that commit. It uses the same cache layout,
+so `--list-backup` and `--restore` work as usual. Without `--revision`, backup
+and deletion continue to select every cached revision of the model.
+
+`--delete` runs only after a successful backup and follows the usual confirmation
+and `--force` behavior. With `-c`, it first checks that the backup covers every
+selected node's revision and cached files. If a peer has a revision or file
+missing from the head's backup, deletion is refused on all nodes and the backup
+is kept. Back up those additional revisions from a head that has them before
+removing their cached copies.
+
+For `--backup --revision ... --delete -c`, the head's selector is resolved once
+to a commit hash. Coverage checks and deletion apply only to that commit on
+each node; other revisions remain, even if a peer's `main` points elsewhere.
+
+**List backups and restore a selected model:**
+
+```bash
+./hf-download.sh --list-backup --backup-dir /mnt/ssd/models
+./hf-download.sh --list-backup QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models --format json
+./hf-download.sh --restore QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models
+./hf-download.sh --restore QuantTrio/MiniMax-M2-AWQ --backup-dir /mnt/ssd/models -c --copy-parallel
+```
+
+Backup listing supports the same formats and sorting as `--list`; the model
+argument is optional. Restore copies the saved revisions and refs into the
+head's cache, retaining additional revisions already there, and leaves the
+backup intact. With `-c`, it distributes the resulting model directory through
+the same SSH, ownership preparation, and serial/parallel rsync path as download.
+
+**Clean up unreferenced model revisions:**
+
+```bash
+./hf-download.sh --cleanup
+./hf-download.sh --cleanup -c
+./hf-download.sh --cleanup -c --force
+```
+
+Cleanup removes model revisions that have no branch or tag refs, retaining
+referenced revisions and datasets/Spaces. It asks for confirmation unless
+`--force` is specified. Because Hugging Face revision deletion uses global
+hashes, a hash also used by a referenced revision or non-model repository is
+retained. This operation does not remove incomplete downloads or clear the
+entire cache.
+
+All cluster operations use the same `-c` host selection described above. Put
+unqualified model IDs (such as `gpt2`) before `-c` so they are not read as host
+names. Without `-c`, saved `COPY_HOSTS` do not trigger remote operations.
+
 **Available options:**
 
 | Flag | Description |
 | :--- | :--- |
-| `<model-name>` | HuggingFace model ID (e.g. `QuantTrio/MiniMax-M2-AWQ`). Required. |
-| `-c, --copy-to <hosts>` | Host(s) to copy the model to after download (space- or comma-separated). Omit hosts to use `COPY_HOSTS` from `.env` or autodiscovery. |
+| `<model-name>` | Hugging Face model ID. Required for download, delete, backup, and restore; optional for backup listing. |
+| `--list` | List cached model revisions. |
+| `--delete` | Delete the model; combine with `--backup` to delete after a successful backup. |
+| `--backup`, `--restore` | Copy a model to/from `--backup-dir`. |
+| `--list-backup` | List saved model revisions in `--backup-dir`. |
+| `--backup-dir <path>` | Existing head-node backup directory. |
+| `--cleanup` | Remove unreferenced model revisions. |
+| `--force` | Skip deletion or cleanup confirmation. |
+| `--revision <revision>` | With `--backup` or `--delete`, select one cached commit by hash, unique prefix (7+ characters), or branch/tag. |
+| `--format <format>` | Listing format: `console`, `csv`, `json`, or `md`. |
+| `--sort <order>` | Listing sort passed to `hf cache ls` (default: `size:desc`). |
+| `-c, --copy-to [hosts]` | Include peer nodes (space- or comma-separated). Omit hosts to use `COPY_HOSTS` from `.env` or autodiscovery. |
 | `--copy-to-host` | Alias for `--copy-to` (backwards compatibility). |
-| `--copy-parallel` | Copy to all hosts concurrently instead of serially. |
+| `--copy-parallel` | With `-c`, distribute downloads or restores concurrently. |
 | `-u, --user <user>` | SSH username for remote copies (default: current user). |
 | `--config <file>` | Path to `.env` configuration file (default: `.env` in script directory). |
 | `-h, --help` | Show help message. |

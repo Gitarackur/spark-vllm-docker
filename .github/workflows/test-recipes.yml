@@ -7,6 +7,15 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
+      - 'build-and-copy.sh'
+      - 'docker/image_identity.py'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
@@ -17,6 +26,15 @@ on:
       - 'run-recipe.py'
       - 'run-recipe.sh'
       - 'launch-cluster.sh'
+      - 'autodiscover.sh'
+      - 'cluster_topology.py'
+      - 'setup-cluster.sh'
+      - 'setup-cluster.py'
+      - 'setup_cluster_node.py'
+      - 'build-and-copy.sh'
+      - 'docker/image_identity.py'
+      - 'hf-download.sh'
+      - 'hf-cache.py'
       - 'recipes/**'
       - 'mods/fix-qwen3-next-autoround/**'
       - 'mods/memory-profile/**'
@@ -55,6 +73,22 @@ jobs:
     - name: Test Qwen3-Next AutoRound compatibility mod
       run: python3 tests/test_qwen3_next_autoround_mod.py
 
+    - name: Test Hugging Face cache ownership repair
+      run: python3 tests/test_hf_download_permissions.py
+
+    - name: Test ring discovery and routed distribution
+      run: python3 tests/test_cluster_topology.py
+
+    - name: Test cluster setup and restore without live nodes
+      run: |
+        bash -n setup-cluster.sh
+        python3 tests/test_setup_cluster.py
+
+    - name: Test Hugging Face cache management and copies
+      run: |
+        python3 tests/test_hf_cache_management.py
+        bash tests/test_hf_download_copy.sh
+
     - name: Test memory profiling mod
       run: |
         python3 tests/test_memory_profile_mod.py
@@ -62,11 +96,17 @@ jobs:
 
     - name: Run recipe integration tests
       run: |
+        python3 tests/test_run_recipe.py
         ./tests/test_recipes.sh -v
         ./tests/test_launch_cluster_image_sync.sh
         ./tests/test_launch_cluster_vllm_pr.sh
         ./tests/test_launch_cluster_earlyoom.sh
         python3 tests/test_launch_cluster_networking.py
+
+    - name: Test Docker image identity and distribution
+      run: |
+        python3 tests/test_image_identity.py
+        bash tests/test_build_and_copy.sh
     
     - name: Verify all recipes with dry-run
       run: |

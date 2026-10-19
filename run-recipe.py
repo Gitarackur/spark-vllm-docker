@@ -93,6 +93,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from cluster_topology import Topology, validate_launch
+
 try:
     import yaml
 except ImportError:
@@ -190,7 +192,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         model (str, optional): HuggingFace model ID for --setup downloads
         mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm')
         defaults (dict, optional): Default values for command placeholders
-        env (dict, optional): Environment variables to export before running
+        env (dict, optional): Container environment defaults; CLI -e values override them
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
         cluster_only (bool, optional): If True, recipe cannot run in solo mode
         solo_only (bool, optional): If True, recipe cannot run in cluster mode
@@ -352,7 +354,8 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
 
 
 def build_image(
-    image: str, copy_to: list[str] | None = None, build_args: list[str] | None = None
+    image: str, copy_to: list[str] | None = None, build_args: list[str] | None = None,
+    *, copy_only: bool = False,
 ) -> bool:
     """
     Build the container image using build-and-copy.sh.
@@ -384,7 +387,11 @@ def build_image(
         return False
 
     cmd = [str(BUILD_SCRIPT), "-t", image]
-    if build_args:
+    if ENV_FILE and ENV_FILE.exists():
+        cmd.extend(["--config", str(ENV_FILE)])
+    if copy_only:
+        cmd.append("--no-build")
+    elif build_args:
         cmd.extend(build_args)
     if copy_to:
         cmd.extend(["--copy-to", ",".join(copy_to), "--copy-parallel"])
@@ -424,6 +431,8 @@ def download_model(model: str, copy_to: list[str] | None = None) -> bool:
         return False
 
     cmd = [str(DOWNLOAD_SCRIPT), model]
+    if ENV_FILE and ENV_FILE.exists():
+        cmd.extend(["--config", str(ENV_FILE)])
     if copy_to:
         cmd.extend(["--copy-to", ",".join(copy_to), "--copy-parallel"])
 
@@ -439,10 +448,9 @@ def check_model_exists(model: str) -> bool:
     """
     Check if a model exists in the HuggingFace cache.
 
-    Checks the standard HF cache location for completed downloads.
+    Uses the same cache environment variables and path expansion as hf-download.sh.
 
     EXTENSIBILITY:
-    - To support custom cache locations: Add HF_HOME env var support
     - To verify model integrity: Check for complete snapshot with config.json
     - To support other model sources: Add URL/path prefix detection
 
@@ -455,7 +463,15 @@ def check_model_exists(model: str) -> bool:
     # Convert model name to cache directory format
     # e.g., "Salyut1/GLM-4.7-NVFP4" -> "models--Salyut1--GLM-4.7-NVFP4"
     cache_name = f"models--{model.replace('/', '--')}"
-    cache_path = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+    cache_home = os.path.expandvars(os.path.expanduser(os.environ.get(
+        "HF_HOME", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface")
+    )))
+    hub_path = os.path.expandvars(os.path.expanduser(os.environ.get(
+        "HF_HUB_CACHE", os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(cache_home, "hub"))
+    )))
+    if not hub_path:
+        return False
+    cache_path = Path(hub_path) / cache_name
 
     if cache_path.exists():
         # Check for snapshots directory which indicates complete download
@@ -475,14 +491,13 @@ def generate_launch_script(
     """
     Generate a bash launch script from the recipe.
 
-    Creates a self-contained bash script that runs inside the container.
-    Handles template substitution, environment variables, and solo mode adjustments.
+    Creates a bash script that runs inside the configured container environment.
+    Handles template substitution and solo mode adjustments.
 
     EXTENSIBILITY:
     - To add new template variables: Add them to recipe['defaults'] or CLI overrides
     - To add pre/post hooks: Add 'pre_command'/'post_command' fields to recipe schema
     - To add conditional logic: Use Jinja2 templating instead of str.format()
-    - To support GPU selection: Add CUDA_VISIBLE_DEVICES to env handling
 
     TEMPLATE VARIABLES (use {variable_name} in recipe command):
         port: API server port (default from recipe)
@@ -523,14 +538,6 @@ def generate_launch_script(
 
     # Build the script
     lines = ["#!/bin/bash", f"# Generated from recipe: {recipe['name']}", ""]
-
-    # Add environment variables
-    env_vars = recipe.get("env", {})
-    if env_vars:
-        lines.append("# Environment variables")
-        for key, value in env_vars.items():
-            lines.append(f'export {key}="{value}"')
-        lines.append("")
 
     # Format the command with parameters
     command = recipe["command"]
@@ -851,7 +858,7 @@ Examples:
         dest="env_vars",
         default=[],
         metavar="VAR=VALUE",
-        help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.",
+        help="Container environment variable (overrides recipe env). Repeatable; last value wins.",
     )
     launch_group.add_argument(
         "--apply-mod",
@@ -1073,6 +1080,12 @@ Examples:
     model = recipe.get("model")
     build_args = recipe.get("build_args", [])
 
+    # Keep Docker's -e syntax (including bare names), with the last CLI value
+    # replacing any recipe default for that variable.
+    container_env = {str(key): f"{key}={value}" for key, value in (recipe.get("env") or {}).items()}
+    for env_var in args.env_vars:
+        container_env[env_var.split("=", 1)[0]] = env_var
+
     # Parse nodes - check command line first, then .env file, then autodiscover
     nodes = parse_nodes(args.nodes) if not args.solo else []
     nodes_from_env = False
@@ -1211,6 +1224,31 @@ Examples:
             print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         print()
 
+    ring_env = {}
+    if is_cluster and env.get("CLUSTER_LINKS"):
+        try:
+            topology = Topology.from_env(env)
+            if not (args.build_only or args.download_only):
+                # Validate the effective launch before setup mutates image/model state.
+                topology_overrides = {key: getattr(args, key) for key in (
+                    "port", "host", "tensor_parallel", "gpu_memory_utilization", "max_model_len"
+                ) if getattr(args, key) is not None}
+                topology_script = generate_launch_script(
+                    recipe, topology_overrides, is_solo=False, extra_args=extra_args, use_ray=use_ray)
+                nccl_env = {key.removeprefix("CONTAINER_"): value for key, value in env.items()
+                            if key.startswith("CONTAINER_")}
+                for key, assignment in container_env.items():
+                    if "=" in assignment:
+                        nccl_env[key] = assignment.split("=", 1)[1]
+                    elif key in os.environ:
+                        nccl_env[key] = os.environ[key]
+                    else:
+                        nccl_env.pop(key, None)
+                ring_env = validate_launch(topology, nodes, topology_script, use_ray, nccl_env)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+
     # --- Build Phase ---
     if args.build_only or args.setup or args.force_build:
         if args.dry_run:
@@ -1235,18 +1273,24 @@ Examples:
                 print()
             else:
                 print(f"Container '{container}' already exists locally.")
-                # Check worker nodes in cluster mode
-                if copy_targets:
-                    missing_on = []
-                    for worker in copy_targets:
-                        if not check_image_exists(container, worker):
-                            missing_on.append(worker)
-                    if missing_on:
-                        print(f"Container missing on workers: {', '.join(missing_on)}")
-                        print("Building and copying...")
-                        if not build_image(container, missing_on, build_args):
-                            print("Error: Failed to build/copy container")
-                            return 1
+                if copy_targets and env.get("CLUSTER_LINKS"):
+                    # Compare exact image IDs using the saved copy paths.
+                    if not build_image(container, copy_targets, copy_only=True):
+                        print("Error: Failed to synchronize container image")
+                        return 1
+                else:
+                    # Check worker nodes in cluster mode
+                    if copy_targets:
+                        missing_on = []
+                        for worker in copy_targets:
+                            if not check_image_exists(container, worker):
+                                missing_on.append(worker)
+                        if missing_on:
+                            print(f"Container missing on workers: {', '.join(missing_on)}")
+                            print("Building and copying...")
+                            if not build_image(container, missing_on, build_args):
+                                print("Error: Failed to build/copy container")
+                                return 1
                 print()
 
         if args.build_only:
@@ -1257,7 +1301,7 @@ Examples:
     if model and (args.download_only or args.setup or args.force_download):
         if args.dry_run:
             model_exists = check_model_exists(model)
-            if args.force_download or not model_exists:
+            if args.force_download or not model_exists or (copy_targets and env.get("CLUSTER_LINKS")):
                 print(f"Would download model: {model}")
                 if copy_targets:
                     print(f"  Would copy to: {', '.join(copy_targets)}")
@@ -1267,7 +1311,7 @@ Examples:
         else:
             model_exists = check_model_exists(model)
 
-            if args.force_download or not model_exists:
+            if args.force_download or not model_exists or (copy_targets and env.get("CLUSTER_LINKS")):
                 print("=== Downloading Model ===")
                 if not download_model(model, copy_targets):
                     print("Error: Failed to download model")
@@ -1284,6 +1328,12 @@ Examples:
     # --- Run Phase ---
     if args.build_only or args.download_only:
         return 0
+
+    # Require the recipe's model locally before starting a container.
+    if not args.dry_run and model and not check_model_exists(model):
+        print(f"Error: Model '{model}' not found in the local Hugging Face cache.")
+        print("Rerun the same command with --setup to download the model before launching.")
+        return 1
 
     # Check if image exists (if not using --setup)
     if not args.dry_run and not args.setup and not check_image_exists(container):
@@ -1352,6 +1402,11 @@ Examples:
         use_ray=use_ray,
     )
 
+    for key, value in ring_env.items():
+        # Validation already rejected conflicting values. Make required ring
+        # settings explicit even when the CLI used a bare, unset variable.
+        container_env[key] = f"{key}={value}"
+
     if args.dry_run:
         print("=== Generated Launch Script ===")
         print(script_content)
@@ -1360,7 +1415,7 @@ Examples:
         print("1. The above script is saved to a temporary file")
         print()
         print("2. launch-cluster.sh is called with:")
-        cmd_parts = ["   ./launch-cluster.sh", "-t", container]
+        cmd_parts = ["./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
         for layer_type, value in cli_launch_layers:
@@ -1382,7 +1437,7 @@ Examples:
             cmd_parts.extend(["-n", ",".join(nodes)])
         if args.nccl_debug:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
-        for env_var in args.env_vars:
+        for env_var in container_env.values():
             cmd_parts.extend(["-e", env_var])
         for port_mapping in args.port_mappings:
             cmd_parts.extend(["-p", port_mapping])
@@ -1418,8 +1473,8 @@ Examples:
             cmd_parts.extend(["--shm-size-gb", str(args.shm_size_gb)])
         if args.config_file:
             cmd_parts.extend(["--config", args.config_file])
-        cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
-        print(" ".join(cmd_parts))
+        print("   " + shlex.join(cmd_parts)
+              + " \\\n      --launch-script /tmp/tmpXXXXXX.sh")
         print()
         print("3. The launch script runs inside the container")
         return 0
@@ -1474,7 +1529,7 @@ Examples:
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])
 
-        for env_var in args.env_vars:
+        for env_var in container_env.values():
             cmd.extend(["-e", env_var])
 
         for port_mapping in args.port_mappings:
