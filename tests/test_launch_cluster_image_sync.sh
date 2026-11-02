@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Focused behavior tests for launch-cluster.sh image consistency checks.
+# Focused launch-cluster.sh image consistency and failure diagnostic tests.
 # All Docker and SSH operations are handled by fake commands.
 
 set -euo pipefail
@@ -59,6 +59,7 @@ set -euo pipefail
 echo "docker $*" >> "$TEST_LOG"
 
 if [[ "${1:-}" == "ps" ]]; then
+    [[ "${EXISTING_CONTAINER:-false}" != true ]] || echo vllm_node
     exit 0
 fi
 
@@ -75,6 +76,23 @@ if [[ "${1:-}" == "image" && "${2:-}" == "inspect" ]]; then
     exit 0
 fi
 
+if [[ "${1:-}" == "exec" && ( "${2:-}" == -i || "${2:-}" == -it ) ]]; then
+    exec python3 -c '
+import os, pathlib, sys, time
+log = os.environ["TEST_LOG"]
+pathlib.Path(log + ".head-pid").write_text(str(os.getpid()))
+pathlib.Path(log + ".launcher-pid").write_text(str(os.getppid()))
+if os.environ.get("READ_HEAD_STDIN") == "true":
+    pathlib.Path(log + ".stdin").write_text(sys.stdin.read())
+time.sleep(float(os.environ.get("HEAD_EXEC_DELAY", "0")))
+sys.exit(int(os.environ.get("HEAD_EXEC_STATUS", "0")))'
+fi
+
+if [[ "${1:-}" == "logs" ]]; then
+    echo 'earlyoom: head memory report'
+    exit "${HEAD_LOG_STATUS:-0}"
+fi
+
 exit 0
 DOCKER
 
@@ -84,6 +102,10 @@ set -euo pipefail
 echo "ssh $*" >> "$TEST_LOG"
 
 if [[ "$*" == *"docker ps --format"* ]]; then
+    if [[ "${EXISTING_CONTAINER:-false}" == true ]]; then
+        echo vllm_node
+        exit 0
+    fi
     exit 1
 fi
 
@@ -99,6 +121,26 @@ if [[ "$*" == *"docker image inspect"* ]]; then
     fi
 fi
 
+if [[ "$*" == *"docker logs"* ]]; then
+    echo 'Worker_TP1: original startup exception'
+    exit "${WORKER_LOG_STATUS:-0}"
+fi
+
+if [[ "$*" == *"docker exec vllm_node bash -c "* ]]; then
+    # Model an attached SSH/docker client. The process itself stays alive until
+    # the remote command exits, or until the launcher terminates the client.
+    export MOCK_WORKER_FAIL=true
+    if [[ -n "${FAIL_WORKER_NODE:-}" && "$*" != *"$FAIL_WORKER_NODE docker exec "* ]]; then
+        export MOCK_WORKER_FAIL=false
+    fi
+    exec python3 -c '
+import os, pathlib, sys, time
+pathlib.Path(os.environ["TEST_LOG"] + ".worker-" + str(os.getpid())).touch()
+failing = os.environ["MOCK_WORKER_FAIL"] == "true"
+time.sleep(float(os.environ.get("WORKER_EXEC_DELAY", "60")) if failing else 60)
+sys.exit(int(os.environ.get("WORKER_EXEC_STATUS", "0")) if failing else 0)'
+fi
+
 exit 0
 SSH
 
@@ -106,8 +148,13 @@ SSH
 #!/bin/bash
 exit 0
 SLEEP
+    cat > "$FAKE_BIN_DIR/scp" <<'SCP'
+#!/bin/bash
+echo "scp $*" >> "$TEST_LOG"
+exit 0
+SCP
 
-    chmod +x "$FAKE_BIN_DIR/docker" "$FAKE_BIN_DIR/ssh" "$FAKE_BIN_DIR/sleep"
+    chmod +x "$FAKE_BIN_DIR/docker" "$FAKE_BIN_DIR/ssh" "$FAKE_BIN_DIR/sleep" "$FAKE_BIN_DIR/scp"
 }
 
 run_launch() {
@@ -125,6 +172,26 @@ run_launch() {
                 --ib-if ib0 \
                 --no-cache-dirs \
                 -d "$@" start
+    ) > "$OUTPUT_LOG" 2>&1
+}
+
+run_exec() {
+    (
+        cd "$FIXTURE_DIR"
+        action_args=(exec vllm serve test-model --tensor-parallel-size "${EXEC_TEST_TP:-2}")
+        if [[ -n "${EXEC_TEST_SCRIPT:-}" ]]; then
+            action_args=(--launch-script "$EXEC_TEST_SCRIPT")
+        fi
+        PATH="$FAKE_BIN_DIR:$PATH" \
+            TEST_LOG="$TEST_LOG" \
+            LOCAL_INSPECT_FILE="$LOCAL_INSPECT_FILE" \
+            REMOTE_INSPECT_FILE="$REMOTE_INSPECT_FILE" \
+            LOCAL_IP="10.0.0.1" \
+            exec ./launch-cluster.sh \
+                --config "$FIXTURE_DIR/test.env" \
+                --nodes "${EXEC_TEST_NODES:-10.0.0.1,10.0.0.2}" \
+                --eth-if eth0 --ib-if ib0 --no-cache-dirs \
+                "$@" "${action_args[@]}"
     ) > "$OUTPUT_LOG" 2>&1
 }
 
@@ -256,6 +323,152 @@ test_missing_head_image_aborts_before_launch() {
     pass "missing head image aborts before containers start"
 }
 
+test_failed_exec_captures_logs_before_cleanup() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 run_exec || status=$?
+    [[ "$status" == 42 ]] || fail "head exit status was not preserved: $status"
+    assert_output_contains 'earlyoom: head memory report'
+    assert_output_contains 'Worker_TP1: original startup exception'
+    assert_log_contains '^docker logs --timestamps --tail 200 vllm_node$'
+    assert_log_contains '^ssh .*ConnectTimeout=5 .*docker logs --timestamps --tail 200 vllm_node$'
+    local worker_log_line first_stop_line
+    worker_log_line=$(grep -nE '^ssh .*docker logs ' "$TEST_LOG" | cut -d: -f1)
+    first_stop_line=$(grep -nE '^docker stop ' "$TEST_LOG" | head -1 | cut -d: -f1)
+    [[ "$worker_log_line" -lt "$first_stop_line" ]] || fail "containers stopped before worker log collection"
+    pass "failed foreground exec captures head and worker logs before cleanup"
+}
+
+test_log_errors_preserve_exec_status_and_cleanup() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 HEAD_LOG_STATUS=1 WORKER_LOG_STATUS=255 run_exec || status=$?
+    [[ "$status" == 42 ]] || fail "log collection replaced head exit status: $status"
+    assert_output_contains 'Could not collect head container logs'
+    assert_output_contains 'Could not collect worker container logs'
+    assert_log_contains '^docker stop vllm_node$'
+    assert_log_contains '^ssh .*docker stop vllm_node$'
+    pass "unavailable logs preserve the original failure and cluster cleanup"
+}
+
+test_successful_and_daemon_exec_do_not_dump_logs() {
+    setup_fixture
+    run_exec || fail "successful foreground exec failed"
+    assert_log_not_contains 'docker logs '
+    setup_fixture
+    HEAD_EXEC_STATUS=42 run_exec -d || fail "daemon dispatch failed"
+    assert_log_not_contains 'docker logs '
+    assert_log_not_contains 'docker stop '
+    pass "successful foreground exec and daemon dispatch do not dump logs"
+}
+
+test_solo_failure_captures_only_local_logs() {
+    setup_fixture
+    local status=0
+    HEAD_EXEC_STATUS=42 run_exec --solo || status=$?
+    [[ "$status" == 42 ]] || fail "solo exit status was not preserved: $status"
+    assert_output_contains 'earlyoom: head memory report'
+    assert_log_not_contains '^ssh '
+    pass "solo failure captures local container logs without contacting peers"
+}
+
+assert_exec_clients_stopped() {
+    local file pid
+    for file in "$TEST_LOG.head-pid" "$TEST_LOG".worker-*; do
+        [[ -e "$file" ]] || continue
+        if [[ "$file" == *.head-pid ]]; then pid=$(< "$file"); else pid=${file##*.worker-}; fi
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            fail "launcher left client $pid running"
+        fi
+    done
+}
+
+test_worker_exit_fails_without_waiting_for_head() {
+    local code expected status started
+    for code in 17 0 255; do
+        setup_fixture
+        status=0
+        expected=$code
+        [[ "$expected" -ne 0 ]] || expected=1
+        started=$SECONDS
+        HEAD_EXEC_DELAY=60 WORKER_EXEC_DELAY=0.1 WORKER_EXEC_STATUS=$code run_exec || status=$?
+        [[ "$status" == "$expected" ]] || fail "worker status $code returned $status"
+        [[ $((SECONDS - started)) -lt 10 ]] || fail "worker failure waited for the head"
+        assert_output_contains "Worker rank 1 on 10.0.0.2 exited with status $code"
+        assert_output_contains 'Worker_TP1: original startup exception'
+        assert_log_contains '^ssh -n .*ServerAliveInterval=5 .*ServerAliveCountMax=3 .*docker exec vllm_node '
+        assert_log_contains '^docker stop vllm_node$'
+        assert_exec_clients_stopped
+    done
+    pass "worker failures, clean early exits and SSH disconnects promptly fail the launch"
+}
+
+test_second_worker_failure_identifies_rank_and_node() {
+    setup_fixture
+    local status=0
+    EXEC_TEST_NODES=10.0.0.1,10.0.0.2,10.0.0.3 EXEC_TEST_TP=3 \
+        FAIL_WORKER_NODE=10.0.0.3 HEAD_EXEC_DELAY=60 WORKER_EXEC_DELAY=0.1 \
+        WORKER_EXEC_STATUS=23 run_exec || status=$?
+    [[ "$status" == 23 ]] || fail "second worker status was not preserved: $status"
+    assert_output_contains 'Worker rank 2 on 10.0.0.3 exited with status 23'
+    assert_exec_clients_stopped
+    pass "a later worker failure identifies its rank and node and reaps all clients"
+}
+
+test_supervised_head_preserves_stdin_and_status() {
+    setup_fixture
+    READ_HEAD_STDIN=true HEAD_EXEC_DELAY=0.1 run_exec <<< 'head input' || fail 'head launch failed'
+    [[ "$(< "$TEST_LOG.stdin")" == 'head input' ]] || fail 'head stdin was lost to background execution'
+    assert_exec_clients_stopped
+    pass "supervised foreground head retains stdin and reaps worker clients on success"
+}
+
+test_recipe_launch_script_worker_failure() {
+    setup_fixture
+    local status=0
+    printf '#!/bin/bash\nvllm serve test-model --tensor-parallel-size 2\n' > "$FIXTURE_DIR/recipe.sh"
+    EXEC_TEST_SCRIPT="$FIXTURE_DIR/recipe.sh" HEAD_EXEC_DELAY=60 WORKER_EXEC_DELAY=0.1 \
+        WORKER_EXEC_STATUS=31 run_exec || status=$?
+    [[ "$status" == 31 ]] || fail "recipe script worker status was lost: $status"
+    assert_output_contains 'Worker rank 1 on 10.0.0.2 exited with status 31'
+    assert_log_contains '^scp '
+    assert_log_contains '^ssh -n .*docker exec vllm_node bash -c /workspace/exec-script.sh'
+    assert_exec_clients_stopped
+    pass "recipe-generated launch scripts receive the same worker failure supervision"
+}
+
+test_failure_preserves_existing_cluster() {
+    setup_fixture
+    local status=0
+    EXISTING_CONTAINER=true HEAD_EXEC_DELAY=60 WORKER_EXEC_DELAY=0.1 \
+        WORKER_EXEC_STATUS=19 run_exec || status=$?
+    [[ "$status" == 19 ]] || fail "existing-cluster worker status was lost: $status"
+    assert_output_contains 'Skipping cleanup'
+    assert_log_not_contains 'docker stop '
+    assert_exec_clients_stopped
+    pass "worker failure reaps clients without stopping pre-existing containers"
+}
+
+test_signal_stops_supervisor_and_clients() {
+    setup_fixture
+    local launch_pid status=0 i launcher_pid
+    HEAD_EXEC_DELAY=60 run_exec &
+    launch_pid=$!
+    for ((i=0; i<200; i++)); do
+        [[ ! -s "$TEST_LOG.launcher-pid" ]] || break
+        /bin/sleep 0.02
+    done
+    [[ -s "$TEST_LOG.launcher-pid" ]] || fail 'head did not start for signal test'
+    launcher_pid=$(< "$TEST_LOG.launcher-pid")
+    kill -TERM "$launcher_pid"
+    wait "$launch_pid" || status=$?
+    [[ "$status" == 143 ]] || fail "SIGTERM exit status was not preserved: $status"
+    assert_log_contains '^docker stop vllm_node$'
+    assert_exec_clients_stopped
+    pass "SIGTERM terminates supervision, reaps clients and cleans up owned containers"
+}
+
 test_matching_images_launch_cluster
 test_unlimited_memlock_on_every_node
 test_mismatched_image_aborts_before_launch
@@ -264,5 +477,15 @@ test_mixed_image_stores_launch_cluster
 test_changed_config_aborts_before_launch
 test_unreadable_content_aborts_before_launch
 test_missing_head_image_aborts_before_launch
+test_failed_exec_captures_logs_before_cleanup
+test_log_errors_preserve_exec_status_and_cleanup
+test_successful_and_daemon_exec_do_not_dump_logs
+test_solo_failure_captures_only_local_logs
+test_worker_exit_fails_without_waiting_for_head
+test_second_worker_failure_identifies_rank_and_node
+test_supervised_head_preserves_stdin_and_status
+test_recipe_launch_script_worker_failure
+test_failure_preserves_existing_cluster
+test_signal_stops_supervisor_and_clients
 
-echo "All $TESTS_PASSED launch-cluster image consistency tests passed."
+echo "All $TESTS_PASSED launch-cluster image consistency and diagnostic tests passed."

@@ -3,7 +3,7 @@ Subject: [PATCH] [Kernel][Quant][MoE] Per-forward NVFP4 W4A4/W4A16 selection for
 
 Upstream-PR: https://github.com/vllm-project/vllm/pull/54617
 Upstream-Commit: 69d21d81808bcea2de3b97a0b68c97545808a043
-Integration-Base: 355553ac22dca4080929ea8f88a446f15df1f3ba
+Integration-Base: 8084f0624dba24aba6ebac62d8e10cc00730a0fe
 
 Preserve #61082's monokernel setting alongside the dynamic NVFP4 MoE settings.
 
@@ -273,7 +273,7 @@ index 0000000000000000000000000000000000000000..bb58ef9015b5678c21be7faee78073ed
 +    assert err.mean() < 2.5e-1, f"mean rel err {err.mean():.3e}"
 +    assert torch.equal(outs[0], outs[2])
 diff --git a/vllm/config/kernel.py b/vllm/config/kernel.py
-index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e480e1498ff 100644
+index 9de86bc6f5cc60cba6beeed5d07293f12bc8ed37..18ad1321ea956eadffb80648002f40763619cfd1 100644
 --- a/vllm/config/kernel.py
 +++ b/vllm/config/kernel.py
 @@ -131,6 +131,7 @@ MoEBackend = Literal[
@@ -284,9 +284,9 @@ index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e48
      "b12x",
      "flashinfer_moe_ep_mega_deep_gemm",
      "marlin",
-@@ -310,6 +311,17 @@ class KernelConfig:
-     in a single launch (DeepSeek-V4.1 on MI355X). A deployment that cannot run
-     it is refused at startup."""
+@@ -318,6 +319,17 @@ class KernelConfig:
+     in a single launch (DeepSeek-V4.1 on MI355X, DeepSeek-V4-Pro at TP8 on
+     MI355X). A deployment that cannot run it is refused at startup."""
  
 +    nvfp4_moe_dynamic_max_tokens: int = Field(default=0, ge=0)
 +    """With moe_backend="flashinfer_cutile", run NVFP4 routed experts as W4A16
@@ -302,7 +302,7 @@ index e4466dea2f87feb9e5306c618fd385d1d6ac94e1..3d6eee04ffc07e72c8526bcc92d81e48
      moe_backend: MoEBackend = "auto"
      """Backend for MoE expert computation kernels. Available options:
  
-@@ -328,6 +340,9 @@ class KernelConfig:
+@@ -336,6 +348,9 @@ class KernelConfig:
        load); requires Blackwell, expert parallelism, and NVSHMEM
      - "flashinfer_b12x": Use FlashInfer CuteDSL fused MoE for SM12x
        (RTX Pro 6000 / DGX Spark)
@@ -742,18 +742,18 @@ index 0000000000000000000000000000000000000000..61e1ff5e6f934face65d0675f817d382
 +            topk_weights.float().contiguous(),
 +        )
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
-index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c1b185b59 100644
+index d265f7629af049dcba68e434961c12bba0b40b46..6862406b840afa60deb1c16983f32101eab38080 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/nvfp4.py
-@@ -35,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import
+@@ -36,6 +36,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import
  )
  from vllm.model_executor.layers.quantization.utils.quant_utils import (
      QuantKey,
 +    amax_for_moe_activation_quant,
  )
+ from vllm.model_executor.utils import move_parameter
  
- logger = init_logger(__name__)
-@@ -47,6 +48,7 @@ class NvFp4MoeBackend(Enum):
+@@ -49,6 +50,7 @@ class NvFp4MoeBackend(Enum):
      FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
      FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
      FLASHINFER_B12X = "FLASHINFER_B12X"
@@ -761,7 +761,7 @@ index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c
      VLLM_CUTLASS = "VLLM_CUTLASS"
      MARLIN = "MARLIN"
      HUMMING = "HUMMING"
-@@ -119,6 +121,13 @@ def backend_to_kernel_cls(
+@@ -130,6 +132,13 @@ def backend_to_kernel_cls(
  
          return [FlashInferB12xExperts]
  
@@ -775,7 +775,7 @@ index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c
      elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
          from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
              CutlassExpertsFp4,
-@@ -170,6 +179,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
+@@ -181,6 +190,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
          "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
          "flashinfer_moe_ep_cutedsl": NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
          "flashinfer_b12x": NvFp4MoeBackend.FLASHINFER_B12X,
@@ -783,7 +783,7 @@ index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c
          "marlin": NvFp4MoeBackend.MARLIN,
          "humming": NvFp4MoeBackend.HUMMING,
          "emulation": NvFp4MoeBackend.EMULATION,
-@@ -346,7 +356,35 @@ def convert_to_nvfp4_moe_kernel_format(
+@@ -369,7 +379,35 @@ def convert_to_nvfp4_moe_kernel_format(
      torch.Tensor,
  ]:
      use_a16 = _use_a16(nvfp4_backend, use_a16)
@@ -820,7 +820,7 @@ index 80aa9122f447b30867f449855b7e7362c498aaec..2a72aedd075aeea3660b0c1b523ae68c
          if a13_scale is None or a2_scale is None:
              if not use_a16:
                  raise ValueError("b12x NVFP4 MoE requires activation scales")
-@@ -551,8 +589,10 @@ def make_nvfp4_moe_quant_config(
+@@ -574,8 +612,10 @@ def make_nvfp4_moe_quant_config(
              gemm1_beta=getattr(layer, "swiglu_beta", None),
              gemm1_clamp_limit=swiglu_limit,
          )

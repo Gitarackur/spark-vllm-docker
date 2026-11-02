@@ -20,41 +20,237 @@ available independently.
 
 The vLLM order is:
 
-1. [#59958](https://github.com/vllm-project/vllm/pull/59958) and #58815: host-file-gather PLE tables, using #56273's NVFP4 support already in main.
-2. [#59973](https://github.com/vllm-project/vllm/pull/59973): quantized draft heads.
-3. [#59740](https://github.com/vllm-project/vllm/pull/59740) and [#60226](https://github.com/vllm-project/vllm/pull/60226): sparse draft vocabulary, including quantized heads.
-4. [#60068](https://github.com/vllm-project/vllm/pull/60068): adaptive draft depth.
-5. [#54912](https://github.com/vllm-project/vllm/pull/54912): QSA ring sizing.
-6. [#50897](https://github.com/vllm-project/vllm/pull/50897): lookahead-aware prefix hashing.
-7. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
-8. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
-9. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
-10. [#59021](https://github.com/vllm-project/vllm/pull/59021) and [#59025](https://github.com/vllm-project/vllm/pull/59025): separate unquantized linear selection and cuDNN BF16 GEMMs.
-11. The supplied 32,768-token Flash Next draft vocabulary.
-12. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
-13. Wheel package-data inclusion for the draft vocabulary.
-14. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
+1. [#59958](https://github.com/vllm-project/vllm/pull/59958): disk-offloaded PLE tables, using #56273's NVFP4 support already in main. This supersedes the earlier #58815-based host-file-gather implementation.
+2. [#59740](https://github.com/vllm-project/vllm/pull/59740) and [#60226](https://github.com/vllm-project/vllm/pull/60226): sparse draft vocabulary, including quantized heads.
+3. [#60068](https://github.com/vllm-project/vllm/pull/60068): adaptive draft depth.
+4. [#54912](https://github.com/vllm-project/vllm/pull/54912): QSA ring sizing.
+5. [#50897](https://github.com/vllm-project/vllm/pull/50897): lookahead-aware prefix hashing.
+6. [#54614](https://github.com/vllm-project/vllm/pull/54614): dynamic NVFP4 linear kernels.
+7. [#54617](https://github.com/vllm-project/vllm/pull/54617): dynamic NVFP4 MoE.
+8. [#60252](https://github.com/vllm-project/vllm/pull/60252): DFlash2 draft cache block sizing.
+9. [#59021](https://github.com/vllm-project/vllm/pull/59021) and [#59025](https://github.com/vllm-project/vllm/pull/59025): separate unquantized linear selection and cuDNN BF16 GEMMs.
+10. The supplied 32,768-token Flash Next draft vocabulary.
+11. [#60646](https://github.com/vllm-project/vllm/pull/60646): CSF-compressed NVFP4 scale loading.
+12. Wheel package-data inclusion for the draft vocabulary.
+13. The local Flash Next FP4 mod from `mods/draft/flash-next-fp4`:
     opt-in resident CSF expert scales, ModelOpt dispatch, nested scale loading,
     weight-transfer helpers, and post-load host-heap trimming. Its vocabulary
     path is packaged alongside the identical existing vocabulary.
-15. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
+14. `17-flash-next-b12x-loader.patch`: opt-in `--load-format b12x` for Flash
     Next and its embedded MTP draft on Spark, using FlashInfer's checkpoint
     reader and the weight-transfer helpers supplied by patch 16.
 
 [#55601](https://github.com/vllm-project/vllm/pull/55601) is already in the
-validated upstream base. [#59244](https://github.com/vllm-project/vllm/pull/59244)
+validated upstream base. Quantized draft heads from
+[#59973](https://github.com/vllm-project/vllm/pull/59973) are supplied by upstream
+commit `784d1fff0c491b9add10ecd732de8f707a7e7dbe`; the duplicate patch 02 is retired.
+[#59244](https://github.com/vllm-project/vllm/pull/59244)
 modified a BF16-only warmup workaround that upstream
 [#60434](https://github.com/vllm-project/vllm/pull/60434) subsequently removed.
 The series retains the current full-model autotune path, including cuDNN, and
 does not restore the obsolete 32-token cap or BF16-only pass.
 
-The FlashInfer order is
-[#5863](https://github.com/flashinfer-ai/flashinfer/pull/5863) (canonical NVFP4
-W4A4 MoE), then [#5943](https://github.com/flashinfer-ai/flashinfer/pull/5943)
-(SM12x CuTe DSL MXFP8 GEMMs). #5943 includes head
+The FlashInfer series contains
+[#5943](https://github.com/flashinfer-ai/flashinfer/pull/5943)
+(SM12x CuTe DSL MXFP8 GEMMs), at head
 `15c5c8d21388c118558c8370299204aa4b110ced`.
+Canonical NVFP4 W4A4 MoE from
+[#5863](https://github.com/flashinfer-ai/flashinfer/pull/5863) is supplied by
+upstream commit `397b9607c83cf201f3c44684c555c3698869b6bd`.
 
 ## Integration and refresh
+
+The October 31 refresh follows pipeline 382's patch 06 conflict on vLLM
+`87cb835db2bbbaa03e3faa6ae588ba92dce1eea4`. Upstream added a Qwen3.5 multi-module
+MTP test and imports shared with patches 04 and 06. Their refreshed test sections
+preserve that coverage alongside adaptive draft depth and prefix-cache reuse.
+
+The complete series is validated on main
+`564ac0de1b228568cafcbfbe8ccaccc82d6023eb`. Patch 03 retains the refactored
+`share_target_lm_head` helper and its validation, deferring quantization until
+sparse vocabulary rows are selected when a token map is configured. It also
+keeps upstream's MTP step argument and DSpark local-logit path. Patch 06 gives
+the new frontend prefix-hash configuration the same effective connector
+lookahead depth as the engine hasher. Patch 07 preserves the new batch-invariant
+W4A16 test, and patch 17 retains the current embedding imports.
+
+All 15 series entries replay on a fresh archive without historical patch-base
+objects: merged patch 01 skips and the other 14 apply, producing the reviewed
+tree exactly. All 19 subsequent source patchers and CUTLASS pinning pass, and all
+108 changed Python files compile. The 35-test series suite has 33 passes and two
+optional tensor-dependency skips; all 107 build checks pass. Regressions cover
+both MTP patches together, deferred shared-head quantization and its rejection
+rules, matching frontend/engine hash policy, and preservation of upstream's
+batch-invariant test. GPU wheel compilation and inference remain for CI. This
+refresh does not change the separate B12X startup metadata-exchange failure.
+
+The October 30 refresh fixes pipeline 381's patch 05 failure on vLLM
+`deacc3670153845db2f013ea24085d6eaf338874`. Upstream
+[#64110](https://github.com/vllm-project/vllm/pull/64110) moved the QSA cache
+implementation to `qsa_indexer.py` and renamed its classes. Patch 05 now targets
+`QSARawKeyCache` there while retaining the ring-sizing limits and tests.
+
+The full series also targets main
+`dc4dd5a2217bc757232e9fa4d8a8b59e207ca068`. Patch 01 matches the merged #59958
+implementation, including its GPU synchronization guard, so the series detects
+it as already present. Patch 06 preserves the new Mooncake storage layouts from
+[#54307](https://github.com/vllm-project/vllm/pull/54307), the consumer decode
+replay boundary, and the offload event ordering from
+[#63249](https://github.com/vllm-project/vllm/pull/63249).
+
+Validation replays the entire series on a fresh archive without old patch-base
+objects: patch 01 skips and the other 14 patches apply. All 19 subsequent source
+patchers and CUTLASS pinning pass; all 108 changed Python files compile. The
+31-test series suite has 29 passes and two tensor tests skipped because their
+optional dependencies are unavailable; all 107 build checks pass. New regressions cover
+the renamed QSA cache's ring limits and preservation of Mooncake's consumer
+decode replay boundary with lookahead enabled or disabled. Wheel compilation
+and inference remain for CI; the separate B12X startup metadata-exchange failure
+is outside this source refresh.
+
+The October 29 full PR refresh validates vLLM main
+`8084f0624dba24aba6ebac62d8e10cc00730a0fe` and FlashInfer main
+`0d5bbf50b3fb3695dd2a4cf9feddabd2ab172412`. Three referenced PR heads changed:
+
+- #59958 at `396e7e0102896dda576dd1660fb64bc2f6ffd232` replaces
+  `engram_config.host_file_gather` with `engram_config.disk_offload`. It reads
+  checkpoint rows with `preadv`, stages them in fixed buffers, and reports
+  truncated files and unsupported weight reloads explicitly. BF16, FP8 and
+  NVFP4 storage retain upstream decoding and sequence-parallel behavior.
+- #59740 at `178caf8dfb0908542ffb7dbf0f72c42f11b99fc0` uses
+  `draft_lm_head_quantization` for sparse rows, fixes the dynamic scorer rank
+  at 256, and rejects tensor parallelism for `draft_token_map`. The old
+  `draft_token_map_quantization` and `draft_token_map_dynamic_rank` fields are
+  removed. #60226's checkpoint-quantized heads remain supported through the
+  new API, including padded vocabulary outputs and retained checkpoint weights.
+- #59025 at `67b308c2f75f7e26b33055afed0310f771afeee2` limits the cuDNN
+  BF16 dispatch to SM12x and output widths at most 128.
+
+All other active PR heads, including FlashInfer #5943, are unchanged. Merged
+dependencies remain supplied by main. The refresh resolves pipeline 380 job
+692's three MTP import conflicts without restoring the removed fused-expert
+helper. It also preserves upstream draft-logit caching, target attention
+metadata reuse, Qwen2MoE fused activation quantization, and online shared-expert
+name redirection. The lookahead integration test uses upstream's current
+`get_tokenizer` API.
+
+Validation uses fresh archives without old patch-base objects: all 15 vLLM
+patches and the FlashInfer patch reproduce the prepared source trees exactly.
+All 19 subsequent vLLM source patchers, CUTLASS pinning and the FlashInfer
+loader patch pass. All 114 changed vLLM and 17 FlashInfer Python files compile
+and pass undefined-name checks. The 29 series tests include CPU tensor checks
+for PLE checkpoint bytes, stable staging buffers, truncation, sparse logits
+and quantized vocabulary padding. Install `torch`, `safetensors` and `numpy`
+in an isolated test environment to run those two tensor tests; without them,
+the standard-library suite skips them. The loader's CPU tests pass with its
+GPU check skipped. Wheel compilation and inference remain for CI; this source
+refresh does not resolve the separate B12X memory-budget failures.
+
+On October 29, pipeline 380 stopped at FlashInfer patch 02 on upstream
+`82e93625e87b196a9cb0d83fd5d85a29b8e7bdc7`. Upstream now coordinates CUPTI
+availability, initialization, and failure handling across tuning ranks. The
+autotuner section preserves that coordination, including initialization before
+warmup and graph capture, while retaining per-operation timer selection and
+profiling repeats. The recorded PR snapshot and all other file sections are
+unchanged.
+
+The complete patch applies to the failed revision without old patch-base
+objects, all 17 changed Python files compile, and reapplication is detected.
+All 23 CPU series tests pass. The new regression reproduces the old conflict,
+preserves upstream collective fallback, verifies timer-policy precedence, and
+checks that peer initialization failure prevents local warmup. Full wheel
+compilation and inference remain for CI.
+
+The next October 27 run, job 685, reached patch 10 on upstream vLLM
+`c4f2bb4abbdbad9ed5b0a71acd0bd585056eeab8` and conflicted with the new RDNA
+hybrid prefill-dequantization setting. Patch 10 now retains that setting and
+its validator alongside the independent unquantized-linear backend override.
+
+All 15 patches and 19 subsequent Docker source patchers replay on fresh
+archives of both the failed revision and upstream main
+`c56706e88e0a699274e7ed807e072274048d1c33`. CUTLASS pinning passes and all 114
+changed Python files compile on both revisions. The 22 CPU series tests and
+101 build checks pass; the new regression preserves the RDNA setting and
+normalization while adding the unquantized override. Full wheel compilation
+and inference remain for CI.
+
+Later on October 27, job 684 stopped at patch 05 on upstream vLLM
+`6aa70c4beca4f85c44b9f04c23f46326d9261f14`. Upstream added model imports and
+a BF16-indexer regression test in `tests/models/qwen4_exp/test_config.py`.
+Patch 05's test section now preserves those additions alongside all three QSA
+ring tests. Its runtime patch is unchanged.
+
+All 15 patches replay from a fresh source archive without old patch-base
+objects and produce the same tree as the development replay. All 19 subsequent
+Docker source patchers and CUTLASS pinning pass; all 114 changed Python files
+compile. The 21 CPU series tests and 101 build checks pass. The new regression
+reproduces the old import conflict and checks that upstream's BF16-indexer test
+survives. Full wheel compilation and inference remain for CI.
+
+On October 27, pipeline 378 stopped at patch 04 on upstream vLLM
+`90309f6b742cdb1d6305778b81063918cf61be81`. The draft sampler now dispatches
+watermarked and ordinary probabilistic sampling through separate branches.
+Patch 04 keeps both branches, including the sharded-logit arguments, and
+updates confidence before either sampler can modify the logits in place.
+Patch 05's test-import context was also refreshed after upstream removed the
+Qwen3.5 model-config import; the QSA ring implementation and tests are retained.
+
+All 15 patches apply directly to a fresh archive of that revision without old
+patch-base objects, and the resulting tree matches the development replay.
+All 19 subsequent Docker source patchers pass and all 114 changed Python files
+compile. The 20 CPU series tests and 101 build checks pass. The new regression
+covers watermark, sharded probabilistic, greedy, and local-argmax draft sampling,
+including confidence checks before in-place logit modification. Full wheel
+compilation and inference remain for CI.
+
+On October 26, patches 03, 04, 06, 07, and 08 were refreshed against pipeline
+377's failed vLLM base `fe5fe8ba5fb9412ac6deafd192ae8b7c466b96c5`. Patch 03 keeps
+the new Parse MTP validation beside the draft-vocabulary guard. Upstream
+[#61589](https://github.com/vllm-project/vllm/pull/61589) now supplies the core
+lookahead hashing, including multi-token lookahead and the current KV-event
+format. Patch 06 retains the one-token KV-connector extensions and streaming
+hash invalidation, using the upstream integer API. HiSparse retains the legacy
+block-drop behavior. Patch 07 preserves upstream's disabled B12X Buildkite job
+and its AMD router mirror; patch 08 preserves the expanded monokernel settings.
+
+All 15 patches apply directly to a fresh copy of that source tree without old
+patch-base objects. All 107 changed Python files compile, all 19 subsequent
+Docker source patchers apply, and the 19 CPU series tests and 101 build checks
+pass. The regressions cover the Parse MTP guard and local multi-token versus
+connector one-token hashing. GPU compilation and inference remain for CI.
+
+On October 25, conflicting sections of vLLM patches 01, 03, 04, 05, 06, and 16
+were refreshed after nightly pipeline 376 stopped at patch 01's PLE test imports.
+Patch 02 was retired because #59973 is merged; keeping the upstream versions of
+its three conflicting files leaves no changes from that patch. The remaining
+15 patches replay on both the failed base
+`24324ef0f667c633ee9bbb9412343d829f7e6d4e` and upstream main
+`0765565f103d5579382ad61994a041654684778b`.
+
+The refresh preserves upstream FLy and heterogeneous-vocabulary validation,
+the Model Runner V1 dynamic-depth guard, the speculator's live model-length
+property, QSA cache views, and loader configuration access. Streaming updates
+retain all emitted tokens except the final sampled token; lookahead hashes
+covering that discarded token are invalidated. Only conflicting file sections
+were regenerated, and the headers record their refresh base. Strict conflict
+handling remains enabled for tests, documentation, and runtime code.
+
+All 118 Python files changed by the series compile on both bases. The 18 CPU
+patch-series tests pass, including streaming updates whose emitted tokens are
+ahead of computation. GPU compilation and inference remain for CI.
+
+On October 24, the FlashInfer series was refreshed against the failed nightly
+base `431c9687f3bb9a048e194c74a178d7cfb02b1585` and replayed on
+`03f82fddadaebed69879b4e7d28f3df38c4e28d2`. Patch 01 was retired: its added
+lines exactly match the merged #5863 implementation. Patch 02 retains its
+recorded PR snapshot while preserving upstream cold-chain and individual
+timing, `dataclasses.replace` configuration overrides, and SM107 low-M GEMM
+dispatch. Strict patch-conflict handling is unchanged.
+
+Both replays include the loader include-order fix, and all 17 Python files
+changed by the remaining FlashInfer patch compile. CPU regression tests cover
+tuning-policy preservation and SM107/SM12x dispatch. GPU compilation and
+inference remain for CI.
 
 On October 14, the series was refreshed against vLLM
 `355553ac22dca4080929ea8f88a446f15df1f3ba` and FlashInfer
@@ -62,12 +258,12 @@ On October 14, the series was refreshed against vLLM
 replays on the failed nightly base `3f466c852cfd3882820af8dd7963ac775174bce4`.
 
 [#56273](https://github.com/vllm-project/vllm/pull/56273) merged as
-`4e0681ed5654c1d8afb3c104d4381afd08529de8`. Patch 01 now contains only the
-remaining file-gather integration; merged NVFP4 definitions and tests come
-from main. Its header records the merged dependency separately. Existing
-`host_file_gather` configuration, sequence-parallel behavior, and loader fixes
-are retained. #59958's newer `disk_offload` rewrite is not adopted in this
-compatibility fix; its recorded host-file-gather snapshot remains unchanged.
+`4e0681ed5654c1d8afb3c104d4381afd08529de8`. At that point, patch 01 retained
+only the file-gather integration; merged NVFP4 definitions and tests came
+from main. The October 14 compatibility fix preserved `host_file_gather`,
+sequence-parallel behavior, and loader fixes without adopting #59958's newer
+`disk_offload` rewrite. The October 29 full PR refresh above supersedes that
+snapshot and adopts `disk_offload`.
 
 Two other PR snapshots were updated:
 
@@ -352,7 +548,7 @@ are rejected.
 
 Ordinary weights use direct reads into CUDA parameter slices. PLE weights
 retain the regular lane's mmap transport so device, pinned-host, and
-`engram_config.host_file_gather` tables preserve their existing behavior.
+`engram_config.disk_offload` tables preserve their storage behavior.
 Use the regular PLE configuration; the fork's `VLLM_PLE_TABLE_MEMORY` selector
 is not introduced. B12X I/O counters exclude those mmap-loaded PLE bytes.
 Both decoded CSF scales and opt-in resident CSF scales are supported; retained
@@ -372,9 +568,11 @@ The series supplies capabilities; recipe choices remain explicit. In particular,
 `--prefix-match-unit 48`, adaptive draft depth, and dynamic kernel backends are
 not enabled globally.
 
-For an MTP drafter using Model Runner V2, set `draft_token_map` to the installed
-vocabulary path and `draft_token_map_quantization` to `nvfp4` in
-`--speculative-config`. Resolve the path inside the built image with:
+For an MTP drafter using Model Runner V2 and tensor parallel size 1, set
+`draft_token_map` to the installed vocabulary path. For an unquantized lm_head,
+set `draft_lm_head_quantization` to `nvfp4` in `--speculative-config` to quantize
+only the selected rows. Checkpoint-quantized heads retain their own format;
+leave that option unset. Resolve the path inside the built image with:
 
 ```bash
 python3 -c 'from importlib.resources import files; print(files("vllm") / "model_executor/layers/draft_vocab_lists/qwen38_flash_next_32k.json")'

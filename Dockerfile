@@ -123,6 +123,7 @@ WORKDIR $VLLM_BASE_DIR
 ARG FLASHINFER_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_REF=main
 ARG FLASHINFER_BUILD_CUBIN=1
+ARG FLASHINFER_BUILD_JIT_CACHE=1
 ARG FLASHINFER_BUILD_PYTHON=/usr/bin/python3
 
 # FlashInfer's source checkout may carry a .python-version. Keep no-isolation
@@ -253,12 +254,12 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then \
         (cd flashinfer-cubin && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v); \
     fi && \
-    # flashinfer-jit-cache
-    bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
-    cd flashinfer-jit-cache && \
-    uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    # B12X uses runtime JIT; skip AOT providers and their cubin downloads too.
+    if [ "$FLASHINFER_BUILD_JIT_CACHE" = "1" ]; then \
+        bash /tmp/build_flashinfer_jit_providers.sh "$FLASHINFER_BUILD_PYTHON" /workspace/wheels && \
+        (cd flashinfer-jit-cache && uv build --python "$FLASHINFER_BUILD_PYTHON" --no-build-isolation --wheel . --out-dir=/workspace/wheels -v); \
+    fi && \
     # dump git ref and target architecture in the wheels dir
-    cd .. && \
     git rev-parse HEAD > /workspace/wheels/.flashinfer-commit && \
     printf '%s\n' "$FLASHINFER_CUDA_ARCH_LIST" > /workspace/wheels/.flashinfer-arch
 
@@ -649,6 +650,16 @@ RUN python3 /tmp/vllm-patches/patch_vllm_startup_heap_trim.py .
 # tuning tensors as PreparedCall.owners, which b12x retains in serving plans.
 # Keep the trial lifetime in call closures so KV profiling can reclaim them.
 RUN python3 /tmp/vllm-patches/patch_vllm_b12x_moe_tuning_memory.py .
+
+# B12X no longer bounds autotuning batches by resident bytes. Large vision
+# candidates can each allocate GiB; retain one challenger plus the incumbent
+# so image/video preparation fits Spark without disabling autotuning.
+RUN python3 /tmp/vllm-patches/patch_vllm_b12x_tuning_batch.py .
+
+# FlashInfer split B12X intrinsics into a package without re-exporting its
+# scale-swizzle helper. Fix the shared NVFP4/MXFP4 accessor in exported wheels;
+# retain support for custom FlashInfer refs with the original module layout.
+RUN python3 /tmp/vllm-patches/patch_vllm_b12x_scale_swizzle.py .
 
 # WSL guest RAM does not describe CUDA's allocation budget on UMA devices.
 # Keep the fix in exported wheels as well as the runner below.

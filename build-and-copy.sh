@@ -36,11 +36,14 @@ EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
 EXP_B12X_VLLM_REF="dev/karmic-kraken"
 EXP_B12X_FLASHINFER_REPO="https://github.com/local-inference-lab/flashinfer.git"
+# Passing 2026-10-15 CI revision, before the expanded MLA tuning search.
+EXP_B12X_FLASHINFER_REF="9873d7a33f91aeb14c83286552e1f3d84efa2c2e"
 EXP_B12X_TORCH_VERSION="2.13.0"
 EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
 FLASHINFER_REPO="https://github.com/flashinfer-ai/flashinfer.git"
 FLASHINFER_BUILD_CUBIN=1
+FLASHINFER_BUILD_JIT_CACHE=1
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
@@ -117,6 +120,7 @@ generate_build_metadata() {
     local flashinfer_ref="${14}"
     local cutlass_dsl_version="${15}"
     local flashinfer_build_cubin="${16:-1}"
+    local flashinfer_build_jit_cache="${17:-1}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -139,6 +143,7 @@ build_args:
   flashinfer_repo: "${flashinfer_repo}"
   flashinfer_ref: "${flashinfer_ref}"
   flashinfer_build_cubin: ${flashinfer_build_cubin}
+  flashinfer_build_jit_cache: ${flashinfer_build_jit_cache}
   transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
@@ -265,6 +270,12 @@ copy_to_host() {
     local host_copy_start host_copy_end host_copy_time
     host_copy_start=$(date +%s)
     if cluster_copy_ssh "$host" "docker load" < "$TMP_IMAGE"; then
+        local loaded_fingerprint
+        loaded_fingerprint=$(get_remote_image_fingerprint "$host" "$IMAGE_TAG" 2>/dev/null) || loaded_fingerprint=""
+        if [ "$loaded_fingerprint" != "$LOCAL_IMAGE_FINGERPRINT" ]; then
+            echo "Copy to $host failed: loaded image '$IMAGE_TAG' does not match the local image or has incomplete metadata." >&2
+            return 1
+        fi
         host_copy_end=$(date +%s)
         host_copy_time=$((host_copy_end - host_copy_start))
         printf "Copy to %s completed in %02d:%02d:%02d\n" "$host" $((host_copy_time/3600)) $((host_copy_time%3600/60)) $((host_copy_time%60))
@@ -563,6 +574,16 @@ validate_flashinfer_wheel_set() {
     local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
     local python=("$wheels_dir"/flashinfer_python-*.whl)
 
+    if [ "$FLASHINFER_PROFILE" = "b12x" ]; then
+        local cached_commit=""
+        [ ! -f "$wheels_dir/.flashinfer-commit" ] || cached_commit=$(cat "$wheels_dir/.flashinfer-commit")
+        if [ "$cached_commit" != "$EXP_B12X_FLASHINFER_REF" ]; then
+            echo "Error: B12X FlashInfer wheels must match pinned commit $EXP_B12X_FLASHINFER_REF."
+            echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+            return 1
+        fi
+    fi
+
     if [ "$FLASHINFER_BUILD_CUBIN" = "1" ]; then
         if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ]; then
             echo "Error: FlashInfer profile $wheels_dir does not contain exactly one cubin wheel."
@@ -574,12 +595,24 @@ validate_flashinfer_wheel_set() {
         echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
         return 1
     fi
-    if [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
-       [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
+    if [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
         echo "Error: FlashInfer profile $wheels_dir does not contain exactly one complete wheel set."
+        echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
         return 1
     fi
-    python3 ./docker/validate_flashinfer_wheels.py "${jit[0]}" "$GPU_ARCH_LIST"
+    if [ "$FLASHINFER_BUILD_JIT_CACHE" = "1" ]; then
+        if [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ]; then
+            echo "Error: FlashInfer profile $wheels_dir does not contain exactly one JIT-cache wheel."
+            echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+            return 1
+        fi
+        python3 ./docker/validate_flashinfer_wheels.py "${jit[0]}" "$GPU_ARCH_LIST" || return 1
+    elif compgen -G "$wheels_dir/flashinfer_jit_cache*.whl" > /dev/null 2>&1; then
+        echo "Error: B12X FlashInfer profile $wheels_dir must not contain JIT-cache or provider wheels."
+        echo "       Re-run with --rebuild-flashinfer to rebuild the selected wheel set."
+        return 1
+    fi
+    return 0
 }
 
 validate_exported_wheel_set() {
@@ -908,7 +941,11 @@ if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
     fi
     if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
         FLASHINFER_REPO="$EXP_B12X_FLASHINFER_REPO"
+        if [ "$FLASHINFER_REF_SET" = false ]; then
+            FLASHINFER_REF="$EXP_B12X_FLASHINFER_REF"
+        fi
         FLASHINFER_BUILD_CUBIN=0
+        FLASHINFER_BUILD_JIT_CACHE=0
     fi
 fi
 
@@ -1233,7 +1270,7 @@ if [ "$NO_BUILD" = false ]; then
                 echo "       Re-run with --rebuild-flashinfer to explicitly build the fork from source."
                 exit 1
             else
-                echo "Building B12X FlashInfer wheels from $FLASHINFER_REPO ref $FLASHINFER_REF (without cubins)..."
+                echo "Building B12X FlashInfer Python wheel from $FLASHINFER_REPO ref $FLASHINFER_REF (without cubins or JIT-cache)..."
                 BUILD_FLASHINFER=true
                 REBUILD_FLASHINFER=true
             fi
@@ -1257,7 +1294,8 @@ if [ "$NO_BUILD" = false ]; then
                 "${COMMON_BUILD_FLAGS[@]}"
                 "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF"
                 "--build-arg" "FLASHINFER_REPO=$FLASHINFER_REPO"
-                "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN")
+                "--build-arg" "FLASHINFER_BUILD_CUBIN=$FLASHINFER_BUILD_CUBIN"
+                "--build-arg" "FLASHINFER_BUILD_JIT_CACHE=$FLASHINFER_BUILD_JIT_CACHE")
 
             # The checked-in Qwen stack belongs to the upstream lane only.
             # Custom FlashInfer refs/PRs keep their existing unmodified base.
@@ -1433,7 +1471,7 @@ if [ "$NO_BUILD" = false ]; then
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
             "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
             "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
-            "$FLASHINFER_REPO" "$FLASHINFER_REF" "$CUTLASS_DSL_VERSION" "$FLASHINFER_BUILD_CUBIN"
+            "$FLASHINFER_REPO" "$FLASHINFER_REF" "$CUTLASS_DSL_VERSION" "$FLASHINFER_BUILD_CUBIN" "$FLASHINFER_BUILD_JIT_CACHE"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
@@ -1466,34 +1504,33 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
         exit 1
     fi
 
+    # An index ID can exist even when its platform config/layers are missing.
+    # Require usable metadata before trusting matching IDs, too.
+    if ! LOCAL_IMAGE_FINGERPRINT=$(
+        set -o pipefail
+        docker image inspect "$LOCAL_IMAGE_ID" |
+            python3 "$SCRIPT_DIR/docker/image_identity.py"
+    ) || [ -z "$LOCAL_IMAGE_FINGERPRINT" ]; then
+        echo "Error: Cannot verify runnable metadata for local image '$IMAGE_TAG'." >&2
+        exit 1
+    fi
+
     COPY_TARGETS=()
-    LOCAL_IMAGE_FINGERPRINT=""
-    LOCAL_FINGERPRINT_CHECKED=false
     for host in "${COPY_HOSTS[@]}"; do
         REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG") || REMOTE_IMAGE_ID=""
-        if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
-            echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
-            continue
-        fi
         if [ -n "$REMOTE_IMAGE_ID" ]; then
             # Different stores can report different IDs for identical content.
             # Inspect the resolved IDs so a retag cannot change this comparison.
-            if [ "$LOCAL_FINGERPRINT_CHECKED" = false ]; then
-                LOCAL_FINGERPRINT_CHECKED=true
-                LOCAL_IMAGE_FINGERPRINT=$(
-                    set -o pipefail
-                    docker image inspect "$LOCAL_IMAGE_ID" |
-                        python3 "$SCRIPT_DIR/docker/image_identity.py"
-                ) 2>/dev/null || LOCAL_IMAGE_FINGERPRINT=""
-            fi
-            if [ -n "$LOCAL_IMAGE_FINGERPRINT" ]; then
-                REMOTE_IMAGE_FINGERPRINT=$(get_remote_image_fingerprint "$host" "$REMOTE_IMAGE_ID" 2>/dev/null) || REMOTE_IMAGE_FINGERPRINT=""
-                if [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
+            REMOTE_IMAGE_FINGERPRINT=$(get_remote_image_fingerprint "$host" "$REMOTE_IMAGE_ID" 2>/dev/null) || REMOTE_IMAGE_FINGERPRINT=""
+            if [ "$REMOTE_IMAGE_FINGERPRINT" = "$LOCAL_IMAGE_FINGERPRINT" ]; then
+                if [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
+                    echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
+                else
                     echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping (matching image content)."
-                    continue
                 fi
+                continue
             fi
-            echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
+            echo "Image '$IMAGE_TAG' differs or is incomplete on ${SSH_USER}@${host}; will copy."
         else
             echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
         fi
@@ -1513,6 +1550,11 @@ if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
         TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
         echo "Saving image locally to $TMP_IMAGE..."
         docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
+        if ! python3 "$SCRIPT_DIR/docker/image_archive.py" "$TMP_IMAGE"; then
+            echo "Refusing to copy '$IMAGE_TAG'. Docker's containerd store may be missing exportable layer blobs even though the image runs locally." >&2
+            echo "Repair the source image's missing content, then retry. No remote images were loaded." >&2
+            exit 1
+        fi
 
         if [ "$PARALLEL_COPY" = true ]; then
             PIDS=()

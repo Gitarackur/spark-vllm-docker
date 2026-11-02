@@ -96,6 +96,8 @@ if [ "${1:-}" = "build" ]; then
         output=""
         build_arch="12.1a"
         build_cubin=1
+        build_jit_cache=1
+        build_ref="flashinfer-commit"
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --target) target="$2"; shift 2 ;;
@@ -105,6 +107,8 @@ if [ "${1:-}" = "build" ]; then
                         TORCH_CUDA_ARCH_LIST=*) build_arch="${2#TORCH_CUDA_ARCH_LIST=}" ;;
                         FLASHINFER_CUDA_ARCH_LIST=*) build_arch="${2#FLASHINFER_CUDA_ARCH_LIST=}" ;;
                         FLASHINFER_BUILD_CUBIN=*) build_cubin="${2#FLASHINFER_BUILD_CUBIN=}" ;;
+                        FLASHINFER_BUILD_JIT_CACHE=*) build_jit_cache="${2#FLASHINFER_BUILD_JIT_CACHE=}" ;;
+                        FLASHINFER_REF=*) build_ref="${2#FLASHINFER_REF=}" ;;
                     esac
                     shift 2
                     ;;
@@ -120,18 +124,24 @@ if [ "${1:-}" = "build" ]; then
                         if [ "$build_cubin" = 1 ]; then
                             printf 'fake wheel\n' > "$dest/flashinfer_cubin-built.whl"
                         fi
-                        requirements=()
-                        if [ "${MOCK_FLASHINFER_SPLIT_EXPORT:-}" != "" ]; then
-                            requirements=('flashinfer-jit-cache-sm121a==0.7.0')
-                            if [ "$MOCK_FLASHINFER_SPLIT_EXPORT" = complete ]; then
-                                write_wheel_metadata "$dest/flashinfer_jit_cache_sm121a-0.7.0-py3-none-any.whl" \
-                                    flashinfer-jit-cache-sm121a 0.7.0
+                        if [ "$build_jit_cache" = 1 ]; then
+                            requirements=()
+                            if [ "${MOCK_FLASHINFER_SPLIT_EXPORT:-}" != "" ]; then
+                                requirements=('flashinfer-jit-cache-sm121a==0.7.0')
+                                if [ "$MOCK_FLASHINFER_SPLIT_EXPORT" = complete ]; then
+                                    write_wheel_metadata "$dest/flashinfer_jit_cache_sm121a-0.7.0-py3-none-any.whl" \
+                                        flashinfer-jit-cache-sm121a 0.7.0
+                                fi
                             fi
+                            write_wheel_metadata "$dest/flashinfer_jit_cache-built.whl" \
+                                flashinfer-jit-cache 0.7.0 "${requirements[@]}"
                         fi
-                        write_wheel_metadata "$dest/flashinfer_jit_cache-built.whl" \
-                            flashinfer-jit-cache 0.7.0 "${requirements[@]}"
+                        if [ -n "${MOCK_FLASHINFER_UNEXPECTED_WHEEL:-}" ]; then
+                            write_wheel_metadata "$dest/${MOCK_FLASHINFER_UNEXPECTED_WHEEL//-/_}-built.whl" \
+                                "$MOCK_FLASHINFER_UNEXPECTED_WHEEL" 0.7.0
+                        fi
                         printf 'fake wheel\n' > "$dest/flashinfer_python-built.whl"
-                        printf 'flashinfer-commit\n' > "$dest/.flashinfer-commit"
+                        printf '%s\n' "${MOCK_FLASHINFER_EXPORTED_COMMIT:-$build_ref}" > "$dest/.flashinfer-commit"
                         printf '%s\n' "$build_arch" > "$dest/.flashinfer-arch"
                         ;;
                     vllm-export)
@@ -167,7 +177,28 @@ if [ "${1:-}" = "save" ]; then
         shift
     done
     if [ -n "$out" ]; then
-        printf 'fake image\n' > "$out"
+        python3 - "$out" <<'PY'
+import io
+import json
+import os
+import sys
+import tarfile
+
+mode = os.environ.get("MOCK_SAVE_MODE", "complete")
+config = {"os": "linux", "architecture": "arm64",
+          "rootfs": {"type": "layers", "diff_ids": ["sha256:" + "1" * 64]}}
+files = {"manifest.json": json.dumps([{"Config": "config.json", "Layers": ["layer.tar"]}]).encode(),
+         "config.json": json.dumps(config).encode(), "layer.tar": b"layer contents"}
+if mode == "missing-config":
+    del files["config.json"]
+elif mode == "missing-layer":
+    del files["layer.tar"]
+with tarfile.open(sys.argv[1], "w") as archive:
+    for name, data in files.items():
+        entry = tarfile.TarInfo(name)
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+PY
     fi
 fi
 DOCKER
@@ -181,6 +212,14 @@ host="${target#*@}"
 cmd="${*:2}"
 if [[ "$cmd" == *"docker image inspect"* ]]; then
     if [[ "$cmd" != *"--format"* ]]; then
+        if [ -f "$TEST_LOG.loaded-$host" ]; then
+            cat "${MOCK_LOADED_INSPECT_FILE:-$LOCAL_INSPECT_FILE}"
+            exit "${MOCK_LOADED_INSPECT_STATUS:-0}"
+        fi
+        if [ "$host" = samehost ]; then
+            cat "${MOCK_SAMEHOST_INSPECT_FILE:-$LOCAL_INSPECT_FILE}"
+            exit 0
+        fi
         cat "$REMOTE_INSPECT_FILE"
         exit "${REMOTE_INSPECT_STATUS:-0}"
     fi
@@ -201,6 +240,10 @@ fi
 while IFS= read -r _line; do
     :
 done
+if [ "$host" = "${MOCK_LOAD_FAILURE_HOST:-}" ]; then
+    exit 1
+fi
+touch "$TEST_LOG.loaded-$host"
 SSH
 
     cat > "$FAKE_BIN_DIR/curl" <<'CURL'
@@ -647,6 +690,11 @@ test_cleanup_stays_prebuilt() {
     pass "--cleanup is orthogonal and still allows prebuilt path"
 }
 
+test_image_archive_validation() {
+    python3 "$PROJECT_DIR/tests/test_image_archive.py" || fail "saved-image archive regression tests failed"
+    pass "archive validation accepts complete exports and rejects missing or truncated content"
+}
+
 test_prebuilt_copy_parallel() {
     setup_fixture
     run_build -c host1,host2 --copy-parallel || fail "prebuilt copy run failed"
@@ -723,23 +771,100 @@ test_copy_does_not_skip_unreadable_content() {
     for side in local remote; do
         for failure in malformed command; do
             setup_fixture
+            local inspect_status=0
+            [ "$failure" != command ] || inspect_status=1
             if [ "$failure" = malformed ]; then
                 if [ "$side" = local ]; then
                     LOCAL_INSPECT_FILE=/dev/null
                 else
                     REMOTE_INSPECT_FILE=/dev/null
                 fi
-                run_build --no-build -c diffhost || fail "unreadable metadata copy failed"
-            elif [ "$side" = local ]; then
-                LOCAL_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "local inspect failure copy failed"
-            else
-                REMOTE_INSPECT_STATUS=1 run_build --no-build -c diffhost || fail "remote inspect failure copy failed"
             fi
-            assert_log_contains '^docker save '
-            assert_log_contains '^ssh .*@diffhost docker load$'
+            if [ "$side" = local ]; then
+                if LOCAL_INSPECT_STATUS="$inspect_status" run_build --no-build -c diffhost; then
+                    fail "unreadable local metadata was accepted"
+                fi
+                assert_output_contains 'Cannot verify runnable metadata for local image'
+                assert_log_not_contains '^docker save '
+                assert_log_not_contains '^ssh .* docker load$'
+            else
+                REMOTE_INSPECT_STATUS="$inspect_status" run_build --no-build -c diffhost || fail "unreadable remote metadata copy failed"
+                assert_log_contains '^docker save '
+                assert_log_contains '^ssh .*@diffhost docker load$'
+            fi
         done
     done
-    pass "unreadable metadata or failed inspection cannot skip copying different IDs"
+    pass "unreadable metadata rejects the source or forces a remote copy"
+}
+
+test_copy_repairs_incomplete_image_with_matching_id() {
+    setup_fixture
+    REMOTE_INSPECT_FILE="$CASE_DIR/incomplete.json"
+    printf '[{"Id":"sha256:local","Os":"","Architecture":"","RootFS":{}}]\n' > "$REMOTE_INSPECT_FILE"
+    MOCK_SAMEHOST_INSPECT_FILE="$REMOTE_INSPECT_FILE" run_build --no-build -c samehost || fail "incomplete matching-ID image copy failed"
+    assert_log_contains '^docker save '
+    assert_log_contains '^ssh .*@samehost docker load$'
+    assert_log_contains '^ssh .*@samehost docker image inspect vllm-node$'
+    assert_output_contains 'differs or is incomplete'
+    pass "an incomplete remote image is recopied even when its index ID matches"
+}
+
+test_copy_rejects_incomplete_save() {
+    for mode in missing-config missing-layer; do
+        for parallel in false true; do
+            setup_fixture
+            local args=(--no-build -c host1,host2)
+            [ "$parallel" = false ] || args+=(--copy-parallel)
+            if MOCK_SAVE_MODE="$mode" run_build "${args[@]}"; then
+                fail "incomplete Docker save was accepted ($mode, parallel=$parallel)"
+            fi
+            assert_output_contains 'Saved image archive is incomplete or invalid'
+            assert_output_contains 'No remote images were loaded'
+            assert_output_contains 'Cleaning up temporary image'
+            assert_log_not_contains '^ssh .* docker load$'
+        done
+    done
+    pass "successful but incomplete Docker saves fail before any serial or parallel loads"
+}
+
+test_copy_verifies_loaded_content() {
+    for mode in mismatch incomplete inspect-failure; do
+        for parallel in false true; do
+            setup_fixture
+            local loaded_file="$CASE_DIR/loaded.json" inspect_status=0
+            case "$mode" in
+                mismatch) sed 's/"bash"/"python3"/' "$LOCAL_INSPECT_FILE" > "$loaded_file" ;;
+                incomplete) printf '[{"Os":"","Architecture":"","RootFS":{}}]\n' > "$loaded_file" ;;
+                inspect-failure) cp "$LOCAL_INSPECT_FILE" "$loaded_file"; inspect_status=1 ;;
+            esac
+            local args=(--no-build -c host1,host2)
+            [ "$parallel" = false ] || args+=(--copy-parallel)
+            if MOCK_LOADED_INSPECT_FILE="$loaded_file" MOCK_LOADED_INSPECT_STATUS="$inspect_status" run_build "${args[@]}"; then
+                fail "unverified loaded image was accepted ($mode, parallel=$parallel)"
+            fi
+            assert_output_contains 'loaded image .* does not match the local image or has incomplete metadata'
+            assert_log_contains '^ssh .*@host1 docker load$'
+            if [ "$parallel" = true ]; then
+                assert_log_contains '^ssh .*@host2 docker load$'
+                assert_output_contains 'One or more copies failed'
+            fi
+            if grep -q '^Copy complete\.' "$OUTPUT_LOG"; then
+                fail "failed verification reported copy complete"
+            fi
+        done
+    done
+    pass "serial and parallel copies reject unusable or different content after a successful load"
+}
+
+test_copy_load_failure() {
+    setup_fixture
+    if MOCK_LOAD_FAILURE_HOST=host1 run_build --no-build -c host1,host2 --copy-parallel; then
+        fail "parallel copy ignored a failed Docker load"
+    fi
+    assert_log_contains '^ssh .*@host2 docker image inspect vllm-node$'
+    assert_output_contains 'Copy to host1 failed'
+    assert_output_contains 'One or more copies failed'
+    pass "parallel copy waits for other hosts and reports a failed load"
 }
 
 test_copy_missing_local_image_fails() {
@@ -978,7 +1103,7 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build() {
     run_build --exp-b12x --rebuild-vllm || fail "--exp-b12x --rebuild-vllm run failed"
     assert_log_not_contains '^docker pull eugr/spark-vllm-b12x:latest$'
     assert_log_contains '^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=12.1a --build-arg FLASHINFER_CUDA_ARCH_LIST=12.1a .*--build-arg TORCH_VERSION=2.13.0 --build-arg TORCHVISION_VERSION=0.28.0 --build-arg TORCHAUDIO_VERSION=2.11.0 --build-arg CUTLASS_DSL_VERSION=4.7.0 .*--build-arg VLLM_REF=dev/karmic-kraken --build-arg VLLM_REPO=https://github.com/local-inference-lab/vllm --build-arg VLLM_APPLY_PRESET_PRS=0 .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1 --build-arg VLLM_PATCH_B12X_C128A_ALIGNMENT=1'
-    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=main --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 '
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 --build-arg FLASHINFER_BUILD_JIT_CACHE=0 '
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/b12x --build-context vllm_wheels=\./\.wheel-cache/vllm/b12x '
     assert_log_not_contains 'B12X_(FROM_PYPI|REPO|REF|CACHEBUST)='
     assert_log_not_contains '^curl .*prebuilt-flashinfer'
@@ -1005,7 +1130,9 @@ test_b12x_flashinfer_cache_is_independent() {
     cp -a "$regular" "$CASE_DIR/regular-before"
     run_build --exp-b12x --rebuild-vllm || fail "B12X fork build failed"
     [ -f "$b12x/flashinfer_python-built.whl" ] || fail "B12X Python wheel missing"
-    [ -f "$b12x/flashinfer_jit_cache-built.whl" ] || fail "B12X JIT wheel missing"
+    if compgen -G "$b12x/flashinfer_jit_cache*.whl" >/dev/null; then
+        fail "B12X cache includes JIT-cache or provider wheels"
+    fi
     if compgen -G "$b12x/flashinfer_cubin-*.whl" >/dev/null; then
         fail "B12X cache includes a cubin wheel"
     fi
@@ -1018,16 +1145,46 @@ test_b12x_flashinfer_cache_is_independent() {
     : > "$TEST_LOG"
     run_build --use-wheels || fail "regular build after B12X failed"
     assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular '
-    pass "B12X caches cubin-free fork wheels without changing regular wheels"
+    pass "B12X caches only the fork Python wheel without changing regular wheels"
 }
 
 test_b12x_flashinfer_custom_ref_is_isolated() {
     setup_fixture
     run_build --exp-b12x --flashinfer-ref fork-ref --apply-flashinfer-pr 123 || fail "custom fork ref build failed"
-    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=fork-ref --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 .*--build-arg FLASHINFER_PRS=123 '
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REF=fork-ref --build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 --build-arg FLASHINFER_BUILD_JIT_CACHE=0 .*--build-arg FLASHINFER_PRS=123 '
     assert_log_contains '^docker build -t vllm-node-b12x .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/b12x-custom '
     assert_log_not_contains '^curl .*prebuilt-flashinfer'
     pass "custom B12X refs and PRs use the fork and an isolated wheel cache"
+}
+
+test_b12x_flashinfer_rebuilds_unpinned_cache() {
+    setup_fixture
+    local b12x="$FIXTURE_DIR/.wheel-cache/flashinfer/b12x"
+    for cached in newer-commit missing; do
+        printf 'cached wheel\n' > "$b12x/flashinfer_python-built.whl"
+        if [ "$cached" = missing ]; then
+            rm -f "$b12x/.flashinfer-commit"
+        else
+            printf '%s\n' "$cached" > "$b12x/.flashinfer-commit"
+        fi
+        : > "$TEST_LOG"
+        run_build --exp-b12x --rebuild-vllm || fail "B12X pin did not replace $cached provenance"
+        assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e '
+        [ "$(cat "$b12x/.flashinfer-commit")" = 9873d7a33f91aeb14c83286552e1f3d84efa2c2e ] || fail "B12X cache does not match pin"
+    done
+    pass "B12X replaces cached wheels with missing or different source provenance"
+}
+
+test_b12x_flashinfer_rejects_unpinned_export() {
+    setup_fixture
+    export MOCK_FLASHINFER_EXPORTED_COMMIT=unexpected-source
+    if run_build --exp-b12x --rebuild-vllm; then
+        fail "B12X accepted an export from a different commit"
+    fi
+    unset MOCK_FLASHINFER_EXPORTED_COMMIT
+    assert_output_contains 'B12X FlashInfer wheels must match pinned commit'
+    assert_log_not_contains '^docker build --target vllm-export '
+    pass "B12X verifies the exported FlashInfer commit before building vLLM"
 }
 
 test_b12x_flashinfer_rejects_upstream_download() {
@@ -1052,18 +1209,36 @@ test_fork_use_wheels_never_implicitly_builds_flashinfer() {
     pass "fork --use-wheels requires cached FlashInfer or an explicit rebuild"
 }
 
-test_b12x_flashinfer_export_validates_providers() {
+test_b12x_flashinfer_rebuilds_old_jit_cache() {
     setup_fixture
-    MOCK_FLASHINFER_SPLIT_EXPORT=complete run_build --exp-b12x --rebuild-flashinfer || fail "split B12X export failed"
+    local cache="$FIXTURE_DIR/.wheel-cache/flashinfer/b12x"
+    touch "$cache/flashinfer_python-old.whl"
+    write_wheel_metadata "$cache/flashinfer_jit_cache-old.whl" flashinfer-jit-cache 0.7.0
+    write_wheel_metadata "$cache/flashinfer_jit_cache_sm121a-old.whl" flashinfer-jit-cache-sm121a 0.7.0
+    run_build --exp-b12x --rebuild-vllm || fail "B12X did not rebuild its old JIT cache"
+    assert_log_contains '^docker build --target flashinfer-export .*FLASHINFER_BUILD_JIT_CACHE=0 '
+    [ -f "$cache/flashinfer_python-built.whl" ] || fail "rebuilt B12X Python wheel missing"
+    if compgen -G "$cache/flashinfer_jit_cache*.whl" >/dev/null; then
+        fail "B12X retained old JIT-cache wheels"
+    fi
+    pass "B12X replaces old JIT-cache wheel sets with the Python wheel"
+}
+
+test_b12x_flashinfer_export_rejects_compiled_wheels() {
+    setup_fixture
+    run_build --exp-b12x --rebuild-flashinfer || fail "B12X export failed"
     local cache="$FIXTURE_DIR/.wheel-cache/flashinfer/b12x"
     cp -a "$cache" "$CASE_DIR/b12x-before"
-    : > "$TEST_LOG"
-    if MOCK_FLASHINFER_SPLIT_EXPORT=incomplete run_build --exp-b12x --rebuild-flashinfer; then
-        fail "B12X export accepted missing JIT providers"
-    fi
-    diff -r "$cache" "$CASE_DIR/b12x-before" || fail "failed fork export replaced its cache"
-    assert_log_not_contains '^docker build -t '
-    pass "B12X validates JIT providers and preserves the cache after a failed export"
+    local wheel
+    for wheel in flashinfer-cubin flashinfer-jit-cache flashinfer-jit-cache-sm121a; do
+        : > "$TEST_LOG"
+        if MOCK_FLASHINFER_UNEXPECTED_WHEEL="$wheel" run_build --exp-b12x --rebuild-flashinfer; then
+            fail "B12X export accepted unexpected $wheel"
+        fi
+        diff -r "$cache" "$CASE_DIR/b12x-before" || fail "failed fork export replaced its cache"
+        assert_log_not_contains '^docker build -t '
+    done
+    pass "B12X rejects cubin/JIT-cache exports and preserves the previous cache"
 }
 
 test_cleanup_includes_b12x_flashinfer_profiles() {
@@ -1123,7 +1298,7 @@ test_exp_b12x_preserves_blackwell_arches() {
         setup_fixture
         run_build --exp-b12x --gpu-arch "$arch" || \
             fail "--exp-b12x --gpu-arch $arch run failed"
-        assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=main"
+        assert_log_contains "^docker build --target flashinfer-export .*--build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg FLASHINFER_REF=9873d7a33f91aeb14c83286552e1f3d84efa2c2e"
         assert_log_contains "^docker build --target vllm-export .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} .*--build-arg NCCL_NVCC_GENCODE=-gencode=arch=compute_${nccl_arch},code=sm_${nccl_arch} .*--build-arg VLLM_PRESERVE_SM12X_TARGET=1"
         assert_log_contains "^docker build -t vllm-node-b12x .*--build-arg TORCH_CUDA_ARCH_LIST=${arch} --build-arg FLASHINFER_CUDA_ARCH_LIST=${arch} "
         assert_output_contains "Rebuilding FlashInfer wheels for GPU architecture ${arch}\.\.\."
@@ -1524,7 +1699,7 @@ test_local_inference_lab_b12x_applies_to_any_ref() {
         --vllm-repo https://github.com/local-inference-lab/vllm \
         --vllm-ref dev/spark-fixes-7-14 \
         --torch-version 2.12.0 || fail "local-inference-lab alternate ref run failed"
-    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 '
+    assert_log_contains '^docker build --target flashinfer-export .*--build-arg FLASHINFER_REPO=https://github.com/local-inference-lab/flashinfer.git --build-arg FLASHINFER_BUILD_CUBIN=0 --build-arg FLASHINFER_BUILD_JIT_CACHE=0 '
     assert_log_contains '^docker build -t vllm-node .*--build-arg TORCH_VERSION=2.12.0 .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/b12x '
     pass "all local-inference-lab/vllm refs use the fork's FlashInfer wheels"
 }
@@ -1767,8 +1942,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 17 ]; then
-        fail "Expected 17 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 19 ]; then
+        fail "Expected 19 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1822,6 +1997,13 @@ test_b12x_moe_tuning_memory_patch() {
     pass "B12X MoE releases trial buffers before KV cache profiling"
 }
 
+test_b12x_tuning_batch_patch() {
+    if ! python3 "$PROJECT_DIR/tests/test_vllm_b12x_tuning_batch.py"; then
+        fail "B12X bounded tuning-batch regression tests failed"
+    fi
+    pass "B12X bounds live tuning candidates and preserves distributed autotuning"
+}
+
 test_startup_heap_trim_patch() {
     if ! python3 "$PROJECT_DIR/tests/test_vllm_startup_heap_trim_patch.py"; then
         fail "Startup CPU heap trim regression tests failed"
@@ -1866,6 +2048,7 @@ test_use_wheels_never_builds_missing_vllm_implicitly
 test_use_wheels_builds_only_explicit_source_target
 test_use_wheels_builds_only_explicit_flashinfer_target
 test_cleanup_stays_prebuilt
+test_image_archive_validation
 test_prebuilt_copy_parallel
 test_copy_skips_matching_remote_image
 test_copy_only_updates_missing_or_different_hosts
@@ -1873,6 +2056,10 @@ test_copy_skips_matching_content_across_stores
 test_copy_mixed_stores_only_loads_missing_hosts
 test_copy_detects_changed_runtime_config
 test_copy_does_not_skip_unreadable_content
+test_copy_repairs_incomplete_image_with_matching_id
+test_copy_rejects_incomplete_save
+test_copy_verifies_loaded_content
+test_copy_load_failure
 test_copy_missing_local_image_fails
 test_no_build_skips_prebuilt
 test_build_only_flags_warn_on_prebuilt
@@ -1899,9 +2086,12 @@ test_exp_b12x_rebuild_vllm_uses_preset_source_build
 test_exp_b12x_allows_vllm_prs
 test_b12x_flashinfer_cache_is_independent
 test_b12x_flashinfer_custom_ref_is_isolated
+test_b12x_flashinfer_rebuilds_unpinned_cache
+test_b12x_flashinfer_rejects_unpinned_export
 test_b12x_flashinfer_rejects_upstream_download
 test_fork_use_wheels_never_implicitly_builds_flashinfer
-test_b12x_flashinfer_export_validates_providers
+test_b12x_flashinfer_rebuilds_old_jit_cache
+test_b12x_flashinfer_export_rejects_compiled_wheels
 test_cleanup_includes_b12x_flashinfer_profiles
 test_exp_b12x_respects_custom_tag
 test_exp_b12x_rejects_use_wheels
@@ -1934,6 +2124,7 @@ test_swa_block_size_patch
 test_torch_schema_enumeration_patch
 test_instanttensor_vllm_memory_patch
 test_b12x_moe_tuning_memory_patch
+test_b12x_tuning_batch_patch
 test_startup_heap_trim_patch
 test_b12x_cache_integrity_patch
 

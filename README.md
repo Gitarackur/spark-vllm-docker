@@ -67,6 +67,11 @@ remain exempt. This includes protecting `/metrics`, `/tokenize`, and the API
 docs. The patch is included in exported vLLM wheels and leaves the Rust
 frontend unchanged.
 
+B12X source builds fix the shared NVFP4/MXFP4 scale-swizzle accessor for
+FlashInfer's split `intrinsics.reference` module, while retaining support for
+older FlashInfer refs. The fix is applied before compilation and included in
+exported vLLM wheels.
+
 
 ## QUICK START (USING RECIPES)
 
@@ -179,6 +184,7 @@ Launch the server:
 
 ```bash
 ./launch-cluster.sh --solo -t vllm-node-b12x \
+  -e PYTORCH_ALLOC_CONF=per_process_memory_fraction:0.8 \
   -e VLLM_PLE_TABLE_MEMORY=disk \
   -e B12X_DISK_BACKEND=io_uring \
   -e CUTE_DSL_ARCH=sm_121a \
@@ -1765,13 +1771,25 @@ nodes in the cluster and excludes the current node.
 `COPY_HOSTS` from `.env` or autodiscovery; `--copy-parallel` transfers to all
 resolved hosts concurrently.
 
-Hosts with matching image IDs are skipped. If IDs differ, the scripts compare
-the image's platform, ordered filesystem layer hashes, and runtime configuration.
+Distribution compares the image's platform, ordered filesystem layer hashes,
+and runtime configuration, including when image IDs match. An incomplete
+containerd image can have the expected index ID but lack its runnable metadata.
 This recognizes equivalent images across classic Docker and containerd image
 stores, including locally built or saved/loaded images without registry digests.
-The same check runs before cluster launch. It requires Python 3 on the head
-only; workers need Docker. If content cannot be verified, distribution copies
-the image and cluster launch rejects differing IDs.
+Cluster launch also accepts matching IDs or equivalent image content. These
+checks require Python 3 on the head only; workers need Docker. Distribution
+rejects unreadable local metadata and recopies peers whose content cannot be
+verified.
+
+Before loading any peer, distribution validates that the saved archive contains
+every config and layer referenced by its image manifest. Each load is followed
+by another content comparison. Some Docker versions with the containerd image
+store can return success from `docker save` and `docker load` while transferring
+only metadata; see [Moby issue #49473](https://github.com/moby/moby/issues/49473).
+If validation fails, repair the source image's missing layer blobs before
+retrying. An ordinary re-pull on affected Docker versions can reuse existing
+unpacked layers without fetching the missing blobs. The script does not delete
+images or automatically pull replacements, including with `--no-build`.
 
 **Manual host fallback:**
 
@@ -1869,11 +1887,13 @@ from `local-inference-lab/vllm@dev/karmic-kraken` and
 ./build-and-copy.sh --exp-b12x --rebuild-vllm
 ```
 
-This builds the fork's FlashInfer wheels when its cache is missing or incomplete.
-Add `--rebuild-flashinfer` to refresh an existing cached set. B12X builds omit
-the `flashinfer-cubin` wheel and retain the Python, JIT-cache, and required
-JIT provider wheels. They never download regular FlashInfer wheels;
-`--force-flashinfer-download` is unsupported for this lane.
+This builds the fork's FlashInfer Python wheel when its cache is missing or
+incomplete. Add `--rebuild-flashinfer` to refresh an existing cached wheel.
+B12X builds skip cubin downloads and produce only `flashinfer-python`, without
+`flashinfer-cubin`, JIT-cache, or JIT provider wheels. Kernels compile on demand
+at runtime. Older B12X caches containing cubin or JIT-cache/provider wheels are
+rebuilt automatically during source builds. B12X builds never download regular
+FlashInfer wheels; `--force-flashinfer-download` is unsupported for this lane.
 
 It can be combined with `--apply-vllm-pr <pr-num>` to build custom vLLM patches.
 The preset preserves selected Blackwell subarchitectures in vLLM's CUDA 13
@@ -1906,7 +1926,7 @@ Wheel profiles are selected automatically:
 ├── flashinfer/
 │   ├── regular/       # upstream FlashInfer
 │   ├── custom/        # upstream with a custom ref/PR or GPU target
-│   ├── b12x/          # local-inference-lab FlashInfer, without cubins
+│   ├── b12x/          # local-inference-lab FlashInfer, Python wheel only
 │   └── b12x-custom/   # fork with a custom ref/PR or GPU target
 └── vllm/
     ├── regular/
@@ -1924,8 +1944,15 @@ vLLM source includes it. The script travels with locally exported wheels;
 older source refs and downloaded wheel sets without it skip this copy.
 
 The `--exp-b12x` profile and any branch, tag, or commit selected from
-`local-inference-lab/vllm` use the FlashInfer fork. Regular builds keep the
-original `flashinfer-ai/flashinfer` source and published wheel release.
+`local-inference-lab/vllm` use the FlashInfer fork temporarily pinned to
+[`9873d7a33f91aeb14c83286552e1f3d84efa2c2e`](https://github.com/local-inference-lab/flashinfer/commit/9873d7a33f91aeb14c83286552e1f3d84efa2c2e),
+the revision used by the passing October 15, 2026 CI image. This predates the
+expanded MLA tuning search that grew preparation-cache exchanges beyond the
+TCPStore message limit. Its schema-22 cache is separate from the affected
+schema-23 cache; existing caches do not need to be deleted for this rollback.
+Source builds replace cached wheels whose commit does not match the pin.
+Regular builds keep the original `flashinfer-ai/flashinfer` source and published
+wheel release.
 `--flashinfer-ref` and `--apply-flashinfer-pr` apply to the selected FlashInfer
 repository. Source checkout caches are isolated by repository as well.
 
@@ -2175,6 +2202,19 @@ discovered correctly:
 | `--setup` | Force autodiscovery and save configuration to `.env` (even if `.env` already exists). |
 | `start \| stop \| status \| exec` | Action to perform. Use `start` for idle containers or `exec` to run a command. Not compatible with `--launch-script`. |
 | `command` | Command to execute inside the container (only for `exec` action). |
+
+When a foreground `exec` command fails, the launcher prints the last 200
+container-log lines from the head and each worker before cleanup. This includes
+worker tracebacks and earlyoom output in the terminal or CI job log.
+Log collection is limited to 15 seconds per node and preserves the command's
+original exit status.
+
+Foreground no-Ray cluster launches also monitor each worker command through
+its SSH connection. If a worker exits while the head is still running, the
+launcher reports its rank, node and exit status, collects logs, and fails
+without waiting for the server startup timeout. SSH keepalives detect lost
+worker connections. Daemon (`-d`) launches remain detached and do not have this
+host-side supervision.
 
 ### Early OOM Monitor
 
